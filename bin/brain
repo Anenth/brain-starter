@@ -1,0 +1,2654 @@
+#!/usr/bin/env python3
+"""brain — the deterministic layer of a personal intelligence.
+
+Everything in here is exact: search, indexing, dates, slugs, the link graph.
+Judgment lives in skills/ and is the model's job. This file must never guess.
+
+No third-party dependencies. Python 3.9+.
+"""
+
+from __future__ import annotations
+
+import argparse
+import difflib
+import hashlib
+import json
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+import textwrap
+import unicodedata
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+
+# BRAIN_ROOT points the tool at another checkout. Tests use it for a throwaway library.
+ROOT = Path(os.environ.get("BRAIN_ROOT") or Path(__file__).resolve().parent.parent).resolve()
+MEMORY = ROOT / "memory"
+TEMPLATES = ROOT / "templates"
+INDEX_DIR = ROOT / ".brain"
+DB_PATH = INDEX_DIR / "index.db"
+
+# Bump when the index schema changes. It is folded into the fingerprint, so an old
+# index rebuilds itself on the next command instead of failing on a missing column.
+SCHEMA_VERSION = "2c"
+
+# brain.json at the repo root says whose library this is. bin/brain config checks it.
+CONFIG_PATH = ROOT / "brain.json"
+
+
+def load_config() -> dict:
+    try:
+        return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except json.JSONDecodeError as e:
+        sys.exit(f"brain.json is not valid JSON: {e}")
+
+
+CONFIG = load_config()
+
+# The owner's clock. The cloud routines run in UTC. Every date this tool writes or
+# compares is the owner's date, never the machine's.
+try:
+    from zoneinfo import ZoneInfo
+    LOCAL_TZ = ZoneInfo(CONFIG.get("timezone") or "UTC")
+except Exception:  # bad name or no tz database: fall back loudly, not silently
+    print(f"warning: unknown timezone {CONFIG.get('timezone')!r} in brain.json, using UTC", file=sys.stderr)
+    LOCAL_TZ = timezone.utc
+
+
+def now() -> datetime:
+    # BRAIN_TODAY=YYYY-MM-DD pins the clock. Tests use it; nothing else should.
+    pin = os.environ.get("BRAIN_TODAY")
+    if pin:
+        return datetime.fromisoformat(pin).replace(hour=12, tzinfo=LOCAL_TZ)
+    return datetime.now(LOCAL_TZ)
+
+
+def today() -> date:
+    return now().date()
+
+
+# Directory under memory/ -> note type. Anything else is typed "note".
+DIR_TYPES = {
+    "people": "person",
+    "companies": "company",
+    "projects": "project",
+    "meetings": "meeting",
+    "decisions": "decision",
+    "daily": "daily",
+    "inbox": "inbox",
+    "topics": "topic",
+}
+
+WIKILINK = re.compile(r"\[\[([^\]|#]+)(?:[#|][^\]]*)?\]\]")
+# Template prompts get stripped; id tags (gmail/hespia/proposed/ran) are content,
+# not scaffolding, and must survive so MARK/RAN can still find them downstream.
+HTML_COMMENT = re.compile(
+    r"<!--(?!\s*(?:gmail:|hespia-msg:|hespia:|proposed\b|ran:)).*?-->", re.DOTALL
+)
+DATE_RE = re.compile(r"(\d{4}-\d{2}-\d{2})")
+EM_DASH = "—"
+
+
+# --------------------------------------------------------------------------
+# small utilities
+# --------------------------------------------------------------------------
+
+def slugify(text: str) -> str:
+    # Strip accents first so "Zoë Müller" and "Zoe Muller" land on one slug.
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(c for c in text if not unicodedata.combining(c))
+    s = re.sub(r"[^\w\s-]", "", text.strip().lower(), flags=re.UNICODE)
+    s = re.sub(r"[\s_]+", "-", s)
+    s = re.sub(r"-{2,}", "-", s).strip("-")
+    return s or "untitled"
+
+
+def parse_frontmatter(text: str) -> tuple[dict, str]:
+    """Parse the YAML subset we actually use: `key: value` and `key: [a, b]`.
+
+    Deliberately not a YAML parser. If a note needs more than this, the note is
+    doing too much.
+    """
+    if not text.startswith("---"):
+        return {}, text
+    end = text.find("\n---", 3)
+    if end == -1:
+        return {}, text
+    block = text[3:end]
+    rest = text[end + 4:].lstrip("\n")
+    meta: dict = {}
+    for line in block.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or ":" not in line:
+            continue
+        key, _, val = line.partition(":")
+        key, val = key.strip(), val.strip()
+        if val.startswith("[") and val.endswith("]"):
+            meta[key] = [v.strip().strip("\"'") for v in val[1:-1].split(",") if v.strip()]
+        else:
+            meta[key] = val.strip("\"'")
+    return meta, rest
+
+
+def strip_scaffolding(text: str) -> str:
+    """Drop template HTML comments.
+
+    They're prompts for the writer, not content. Indexing them buries real notes
+    under identical template boilerplate, and their example wikilinks would
+    otherwise show up as dangling links in the graph.
+    """
+    return HTML_COMMENT.sub("", text)
+
+
+def strip_code(text: str) -> str:
+    """Drop fenced blocks and inline code. A wikilink inside backticks is an
+    example, not a link, and must not reach the graph."""
+    text = re.sub(r"```.*?```", "", text, flags=re.DOTALL)
+    return re.sub(r"`[^`\n]*`", "", text)
+
+
+def note_type(path: Path, meta: dict) -> str:
+    try:
+        rel = path.relative_to(MEMORY)
+    except ValueError:
+        return "note"
+    # The inbox directory wins over frontmatter. A capture that says `type: capture`
+    # is still unprocessed, and status must be able to see it.
+    if len(rel.parts) > 1 and rel.parts[0] == "inbox":
+        return "inbox"
+    if meta.get("type"):
+        return str(meta["type"])
+    return DIR_TYPES.get(rel.parts[0], "note") if len(rel.parts) > 1 else "note"
+
+
+def note_title(path: Path, meta: dict, body: str) -> str:
+    if meta.get("title"):
+        return str(meta["title"])
+    for line in body.splitlines():
+        if line.startswith("# "):
+            return line[2:].strip()
+    return path.stem.replace("-", " ")
+
+
+def note_date(path: Path, meta: dict) -> str:
+    if meta.get("date"):
+        return str(meta["date"])[:10]
+    m = re.match(r"(\d{4}-\d{2}-\d{2})", path.stem)
+    if m:
+        return m.group(1)
+    return ""
+
+
+def note_updated(body: str, fallback: str) -> str:
+    """The newest date written inside the note, capped at today. A person file
+    created in August and touched every week since is "updated" this week.
+    Computed from the text, never from mtime: a cloud clone resets mtime."""
+    cap = today().isoformat()
+    dates = [d for d in DATE_RE.findall(body) if d <= cap]
+    return max(dates) if dates else fallback
+
+
+# Folders the library ignores. `_to_delete/` holds superseded files that are kept
+# on disk (we never delete the owner's files) but must not pollute search or the graph.
+SKIP_DIRS = {"_to_delete"}
+
+
+def md_files() -> list[Path]:
+    if not MEMORY.exists():
+        return []
+    return sorted(
+        p
+        for p in MEMORY.rglob("*.md")
+        if p.is_file() and SKIP_DIRS.isdisjoint(p.parts)
+    )
+
+
+def fingerprint() -> str:
+    """Cheap change detector for the whole library."""
+    h = hashlib.sha1()
+    h.update(f"schema={SCHEMA_VERSION}\n".encode())
+    for p in md_files():
+        st = p.stat()
+        h.update(f"{p}|{st.st_mtime_ns}|{st.st_size}\n".encode())
+    return h.hexdigest()
+
+
+def resolve_link(target: str) -> str:
+    """Turn a wikilink target into a repo-relative path when it resolves."""
+    t = target.strip().lstrip("./")
+    t = t[:-3] if t.endswith(".md") else t
+    candidates = [MEMORY / f"{t}.md"]
+    candidates += [MEMORY / d / f"{t}.md" for d in DIR_TYPES]
+    candidates += [MEMORY / f"{slugify(t)}.md"]
+    candidates += [MEMORY / d / f"{slugify(t)}.md" for d in DIR_TYPES]
+    real = _real_paths()
+    for c in candidates:
+        hit = real.get(str(c.relative_to(ROOT)).lower())
+        if hit:
+            return hit
+    return t  # unresolved, a link to a note that doesn't exist yet
+
+
+_REAL: dict[str, str] | None = None
+
+
+def _real_paths() -> dict[str, str]:
+    """lowercase repo-relative path -> on-disk path. The Mac filesystem ignores
+    case, so `[[companies/ACME]]` would otherwise index under the wrong name."""
+    global _REAL
+    if _REAL is None:
+        _REAL = {str(p.relative_to(ROOT)).lower(): str(p.relative_to(ROOT)) for p in md_files()}
+    return _REAL
+
+
+def sections_of(body: str) -> dict[str, str]:
+    """Split a note body into its `## ` sections, keyed by lowercased heading."""
+    out: dict[str, str] = {}
+    current = None
+    for line in body.splitlines():
+        if line.startswith("## "):
+            current = line[3:].strip().lower()
+            out[current] = ""
+        elif current is not None:
+            out[current] += line + "\n"
+    return out
+
+
+# --------------------------------------------------------------------------
+# index
+# --------------------------------------------------------------------------
+
+# Daily-note sections that are carried, repeated text: the brief and what it carries.
+# They are indexed, but in a low-weight column, so one carried line does not
+# outrank the meeting note it came from.
+CARRIED_SECTIONS = {"brief", "carried forward"}
+LINK_KEYS = ("people", "projects", "companies", "company", "attendees")
+
+
+def split_daily(body: str) -> tuple[str, str]:
+    """Return (body_without_carried, carried_text) for a daily note."""
+    keep, carried = [], []
+    current = None
+    for line in body.splitlines():
+        if line.startswith("## "):
+            current = line[3:].strip().lower()
+        (carried if current in CARRIED_SECTIONS else keep).append(line)
+    return "\n".join(keep), "\n".join(carried)
+
+
+def connect() -> sqlite3.Connection:
+    INDEX_DIR.mkdir(exist_ok=True)
+    return sqlite3.connect(DB_PATH)
+
+
+def build_index(verbose: bool = False) -> int:
+    db = connect()
+    db.executescript(
+        """
+        DROP TABLE IF EXISTS vocab;
+        DROP TABLE IF EXISTS fts;
+        DROP TABLE IF EXISTS links;
+        DROP TABLE IF EXISTS meta;
+        CREATE VIRTUAL TABLE fts USING fts5(
+            path UNINDEXED, type UNINDEXED, date UNINDEXED, updated UNINDEXED,
+            title, body, carried, meta,
+            tokenize='porter unicode61'
+        );
+        CREATE VIRTUAL TABLE vocab USING fts5vocab(fts, 'row');
+        CREATE TABLE links (src TEXT, dst TEXT);
+        CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
+        """
+    )
+    n = 0
+    for p in md_files():
+        raw = p.read_text(encoding="utf-8", errors="replace")
+        fm, body = parse_frontmatter(raw)
+        body = strip_scaffolding(body)
+        rel = str(p.relative_to(ROOT))
+        typ = note_type(p, fm)
+        carried = ""
+        if typ == "daily":
+            body, carried = split_daily(body)
+        meta_text = " ".join(
+            " ".join(v) if isinstance(v, list) else str(v)
+            for k, v in fm.items() if k not in ("type", "date")
+        )
+        dt = note_date(p, fm)
+        db.execute(
+            "INSERT INTO fts (path, type, date, updated, title, body, carried, meta) VALUES (?,?,?,?,?,?,?,?)",
+            (rel, typ, dt, note_updated(body + carried, dt), note_title(p, fm, body), body, carried, meta_text),
+        )
+        targets = {resolve_link(t) for t in WIKILINK.findall(strip_code(body + "\n" + carried))}
+        # Frontmatter `people: [ravi-kumar]` counts as a link only when it resolves.
+        # A plain name there is a label, not a claim that a note exists.
+        for key in LINK_KEYS:
+            vals = fm.get(key)
+            if isinstance(vals, str):
+                vals = [vals] if vals else []
+            for v in vals or []:
+                v = v.strip("[] ")
+                if v:
+                    r = resolve_link(v)
+                    if (ROOT / r).exists():
+                        targets.add(r)
+        for target in sorted(targets):
+            db.execute("INSERT INTO links VALUES (?,?)", (rel, target))
+        n += 1
+        if verbose:
+            print(f"  indexed {rel}")
+    db.execute("CREATE INDEX idx_links_dst ON links(dst)")
+    db.execute("CREATE INDEX idx_links_src ON links(src)")
+    db.execute("INSERT INTO meta VALUES ('fingerprint', ?)", (fingerprint(),))
+    db.execute("INSERT INTO meta VALUES ('indexed_at', ?)", (now().isoformat(timespec="seconds"),))
+    db.commit()
+    return n
+
+
+def fresh_db() -> sqlite3.Connection:
+    """Open the index, rebuilding first if the library moved underneath it."""
+    if not DB_PATH.exists():
+        build_index()
+        return connect()
+    db = connect()
+    try:
+        row = db.execute("SELECT value FROM meta WHERE key='fingerprint'").fetchone()
+    except sqlite3.DatabaseError:
+        row = None
+    if not row or row[0] != fingerprint():
+        db.close()
+        build_index()
+        db = connect()
+    return db
+
+
+# --------------------------------------------------------------------------
+# search
+# --------------------------------------------------------------------------
+
+def fts_query(terms: str, loose: bool = False) -> str:
+    """Quote user input so ordinary words never trip FTS5's operator syntax.
+    `loose` joins the words with OR, for question-shaped queries."""
+    tokens = re.findall(r'"[^"]*"|\S+', terms)
+    parts = []
+    for tok in tokens:
+        if tok.startswith('"') and tok.endswith('"') and len(tok) > 1:
+            parts.append(tok)
+            continue
+        prefix = tok.endswith("*")
+        word = tok[:-1] if prefix else tok
+        word = re.sub(r'[^\w\s-]', " ", word, flags=re.UNICODE).strip()
+        if not word:
+            continue
+        parts.append(f'"{word}"' + ("*" if prefix else ""))
+    return (" OR " if loose else " ").join(parts)
+
+
+RANK = "bm25(fts, 0,0,0,0, 8.0, 1.0, 0.3, 2.0)"
+
+
+def did_you_mean(db: sqlite3.Connection, terms: str) -> list[str]:
+    words = [w.lower() for w in re.findall(r"\w+", terms) if len(w) > 2]
+    if not words:
+        return []
+    try:
+        vocab = [r[0] for r in db.execute("SELECT term FROM vocab WHERE cnt >= 2").fetchall()]
+    except sqlite3.DatabaseError:
+        return []
+    out = []
+    for w in words:
+        for m in difflib.get_close_matches(w, vocab, n=2, cutoff=0.75):
+            if m != w and m not in out:
+                out.append(m)
+    return out
+
+
+def cmd_search(args) -> int:
+    raw_terms = " ".join(args.query)
+    q = fts_query(raw_terms, loose=args.loose)
+    if not q:
+        print("nothing searchable in that query", file=sys.stderr)
+        return 1
+    db = fresh_db()
+    sql = [
+        f"SELECT path, type, date, updated, title, snippet(fts, 5, '\x1b[1;33m', '\x1b[0m', ' … ', 16), {RANK} AS rank",
+        "FROM fts WHERE fts MATCH ?",
+    ]
+    params: list = [q]
+    if args.type:
+        sql.append("AND type = ?")
+        params.append(args.type)
+    if args.since:
+        sql.append("AND (date >= ? OR updated >= ?)")
+        params += [args.since, args.since]
+    if args.until:
+        sql.append("AND date <= ?")
+        params.append(args.until)
+    sql.append("ORDER BY updated DESC LIMIT ?" if args.recent else "ORDER BY rank LIMIT ?")
+    params.append(args.limit)
+    try:
+        rows = db.execute(" ".join(sql), params).fetchall()
+    except sqlite3.OperationalError as e:
+        print(f"bad query: {e}", file=sys.stderr)
+        return 1
+    if not rows:
+        print("no results. The library does not know about this.")
+        alt = did_you_mean(db, raw_terms)
+        if alt:
+            print(f"  did you mean: {', '.join(alt)}")
+        if not args.loose and len(re.findall(r'\w+', raw_terms)) > 1:
+            print("  try --loose to match any of the words")
+        return 0
+    for path, typ, dt, upd, title, snip, _ in rows:
+        when = dt or ""
+        if upd and upd != dt:
+            when = f"{dt} → {upd}" if dt else upd
+        head = f"\x1b[1;36m{title}\x1b[0m  \x1b[2m{typ}{'  ' + when if when else ''}\x1b[0m"
+        print(head)
+        print(f"  \x1b[2m{path}\x1b[0m")
+        clean = " ".join(snip.split())
+        print(textwrap.fill(clean, width=96, initial_indent="  ", subsequent_indent="  "))
+        print()
+    return 0
+
+
+# --------------------------------------------------------------------------
+# who
+# --------------------------------------------------------------------------
+
+def _print_note_body(path: str) -> None:
+    raw = (ROOT / path).read_text(encoding="utf-8", errors="replace")
+    _, content = parse_frontmatter(raw)
+    blank = False
+    for line in strip_scaffolding(content).splitlines():
+        if not line.strip():
+            if blank:
+                continue
+            blank = True
+        else:
+            blank = False
+        print(f"  {line}".rstrip())
+    print()
+
+
+def _first_line_mentioning(path: str, needles: list[str]) -> str:
+    try:
+        text = (ROOT / path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    for line in strip_scaffolding(text).splitlines():
+        low = line.lower()
+        if any(n in low for n in needles):
+            return " ".join(line.strip().split())[:110]
+    return ""
+
+
+def cmd_who(args) -> int:
+    name = " ".join(args.name)
+    db = fresh_db()
+    slug = slugify(name)
+    people = db.execute(
+        "SELECT path, title FROM fts WHERE type='person' AND (path LIKE ? OR lower(title) LIKE ?)",
+        (f"%{slug}%", f"%{name.lower()}%"),
+    ).fetchall()
+
+    if not people:
+        print(f"no person file for \x1b[1m{name}\x1b[0m")
+        print(f"  create one:  bin/brain new person \"{name}\"")
+        others = db.execute(
+            "SELECT path, type, title FROM fts WHERE type IN ('company','project') "
+            "AND (path LIKE ? OR lower(title) LIKE ?)",
+            (f"%{slug}%", f"%{name.lower()}%"),
+        ).fetchall()
+        for path, typ, title in others:
+            print(f"\n\x1b[1;36m{title}\x1b[0m  \x1b[2m{typ}  {path}\x1b[0m")
+            _print_note_body(path)
+
+    seen: set[str] = set()
+    needles = [name.lower()] + [w for w in name.lower().split() if len(w) > 2]
+    for path, title in people:
+        print(f"\x1b[1;36m{title}\x1b[0m  \x1b[2m{path}\x1b[0m")
+        _print_note_body(path)
+        seen.add(path)
+
+    # One timeline: every note that links them, plus every note that names them
+    # without a link. Newest first. The first row is "last seen".
+    rows: dict[str, tuple] = {}
+    for path, _ in people:
+        for src, typ, dt, ttl in db.execute(
+            "SELECT DISTINCT l.src, f.type, f.date, f.title FROM links l "
+            "LEFT JOIN fts f ON f.path = l.src WHERE l.dst = ?", (path,)
+        ).fetchall():
+            rows[src] = (dt or "", typ or "?", ttl or src, True)
+    for src, typ, dt, ttl in db.execute(
+        "SELECT path, type, date, title FROM fts WHERE fts MATCH ? LIMIT 200",
+        (fts_query(name),),
+    ).fetchall():
+        if src not in seen and src not in rows:
+            rows[src] = (dt or "", typ or "?", ttl or src, False)
+    if args.since:
+        rows = {k: v for k, v in rows.items() if v[0] >= args.since}
+    ordered = sorted(rows.items(), key=lambda kv: kv[1][0], reverse=True)
+    if ordered:
+        # A topic page is a summary compiled later, not a sighting. Last seen is
+        # the newest note that is not one.
+        sightings = [kv for kv in ordered if kv[1][1] != "topic"] or ordered
+        last_path, (last_dt, _, _, _) = sightings[0]
+        print(f"  \x1b[1mlast seen\x1b[0m  {last_dt or 'undated'}  \x1b[2m{last_path}\x1b[0m")
+        snippet = _first_line_mentioning(last_path, needles)
+        if snippet:
+            print(f"    {snippet}")
+        print(f"\n  \x1b[1mmentioned in {len(ordered)} note(s)\x1b[0m  \x1b[2m(* = named but not linked; add [[people/...]])\x1b[0m")
+        for src, (dt, typ, ttl, linked) in ordered[: args.limit]:
+            mark = " " if linked else "*"
+            print(f"   {mark}\x1b[2m{dt or '          '}\x1b[0m  {ttl}  \x1b[2m({typ}) {src}\x1b[0m")
+        if len(ordered) > args.limit:
+            print(f"    \x1b[2m… {len(ordered) - args.limit} more, raise -n\x1b[0m")
+        print()
+
+    # Open chase lines with this person as owner or in the text.
+    items = [it for it in parse_chases() if it["open"] and _chase_matches(it, name)]
+    if items:
+        print(f"  \x1b[1mopen chases ({len(items)})\x1b[0m")
+        for it in sorted(items, key=lambda x: -age_days(x["asked"])):
+            print(f"    {_chase_row(it)}")
+        print()
+    return 0
+
+
+# --------------------------------------------------------------------------
+# new
+# --------------------------------------------------------------------------
+
+TYPE_DIRS = {
+    "person": "people",
+    "company": "companies",
+    "project": "projects",
+    "meeting": "meetings",
+    "decision": "decisions",
+    "daily": "daily",
+    "inbox": "inbox",
+    "topic": "topics",
+}
+DATED = {"meeting", "decision", "daily"}
+
+
+def render_template(kind: str, fields: dict) -> str:
+    tpl = TEMPLATES / f"{kind}.md"
+    if not tpl.exists():
+        return f"---\ntype: {kind}\ntitle: {fields['title']}\ndate: {fields['date']}\n---\n\n# {fields['title']}\n\n"
+    text = tpl.read_text(encoding="utf-8")
+    for key, val in fields.items():
+        text = text.replace("{{" + key + "}}", str(val))
+    # `--set company=Acme` fills the frontmatter line `company:`, and `--set
+    # status=research` overrides a template default. The frontmatter wins over the
+    # template for any key that was passed.
+    fm_end = text.find("\n---", 3)
+    if text.startswith("---") and fm_end != -1:
+        head, tail = text[:fm_end], text[fm_end:]
+        for key, val in fields.items():
+            if key in ("slug", "datetime", "type"):
+                continue
+            head = re.sub(rf"(?m)^{re.escape(key)}:.*$", f"{key}: {val}", head)
+        text = head + tail
+    return text
+
+
+def _similar_person(slug: str) -> list[str]:
+    """Existing people files whose slug shares a name token with the new one.
+    "ada" vs "ada-lovelace", or "ada-lovelace" vs "lovelace-ada"."""
+    new = set(slug.split("-"))
+    hits = []
+    for p in (MEMORY / "people").glob("*.md"):
+        old = set(p.stem.split("-"))
+        if p.stem == slug or (new & old and (new <= old or old <= new)):
+            hits.append(str(p.relative_to(ROOT)))
+    return sorted(hits)
+
+
+def cmd_new(args) -> int:
+    kind = args.kind
+    if kind not in TYPE_DIRS:
+        print(f"unknown type '{kind}'. One of: {', '.join(TYPE_DIRS)}", file=sys.stderr)
+        return 1
+    title = " ".join(args.title) if args.title else today().isoformat()
+    when = args.date or today().isoformat()
+    slug = slugify(title)
+    filename = f"{when}-{slug}.md" if kind in DATED else f"{slug}.md"
+    if kind == "daily":
+        filename = f"{when}.md"
+        title = when
+    path = MEMORY / TYPE_DIRS[kind] / filename
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    if path.exists():
+        print(path.relative_to(ROOT))
+        return 0
+
+    if kind == "person" and not getattr(args, "force", False):
+        similar = _similar_person(slug)
+        if similar:
+            print(f"a similar person file exists. One person, one file.", file=sys.stderr)
+            for s in similar:
+                print(f"  {s}", file=sys.stderr)
+            print(f"  use that file, or pass --force if this really is someone else", file=sys.stderr)
+            return 1
+
+    fields = {
+        "title": title,
+        "slug": slug,
+        "date": when,
+        "datetime": now().isoformat(timespec="minutes"),
+        "type": kind,
+    }
+    for pair in args.set or []:
+        k, _, v = pair.partition("=")
+        fields[k.strip()] = v.strip()
+    path.write_text(render_template(kind, fields), encoding="utf-8")
+    print(path.relative_to(ROOT))
+    return 0
+
+
+def cmd_today(args) -> int:
+    ns = argparse.Namespace(kind="daily", title=None, date=today().isoformat(), set=[], force=False)
+    return cmd_new(ns)
+
+
+# --------------------------------------------------------------------------
+# links
+# --------------------------------------------------------------------------
+
+def cmd_links(args) -> int:
+    db = fresh_db()
+    target = args.path
+    p = Path(target)
+    rel = str(p.resolve().relative_to(ROOT)) if p.exists() else resolve_link(target)
+
+    out = db.execute("SELECT DISTINCT dst FROM links WHERE src = ? ORDER BY dst", (rel,)).fetchall()
+    inb = db.execute("SELECT DISTINCT src FROM links WHERE dst = ? ORDER BY src", (rel,)).fetchall()
+
+    print(f"\x1b[1m{rel}\x1b[0m")
+    if not (ROOT / rel).exists():
+        print("  \x1b[2m(no such note)\x1b[0m")
+    print(f"\n  \x1b[1m→ links out ({len(out)})\x1b[0m")
+    for (dst,) in out:
+        exists = (ROOT / dst).exists()
+        print(f"    {dst}" + ("" if exists else "  \x1b[2m(no such note yet)\x1b[0m"))
+    print(f"\n  \x1b[1m← linked from ({len(inb)})\x1b[0m")
+    for (src,) in inb:
+        print(f"    {src}")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# status
+# --------------------------------------------------------------------------
+
+def cmd_status(args) -> int:
+    db = fresh_db()
+    rows = db.execute("SELECT type, COUNT(*) FROM fts GROUP BY type ORDER BY 2 DESC").fetchall()
+    total = sum(c for _, c in rows)
+    words = db.execute("SELECT SUM(LENGTH(body) - LENGTH(REPLACE(body,' ','')) + 1) FROM fts").fetchone()[0] or 0
+    indexed_at = db.execute("SELECT value FROM meta WHERE key='indexed_at'").fetchone()
+
+    print(f"\x1b[1mlibrary\x1b[0m  {total} notes · ~{words:,} words")
+    for typ, count in rows:
+        print(f"  {count:>5}  {typ}")
+
+    inbox = db.execute("SELECT path, title, date FROM fts WHERE type='inbox' ORDER BY date").fetchall()
+    print(f"\n\x1b[1minbox\x1b[0m  {len(inbox)} unprocessed")
+    for path, title, dt in inbox[:10]:
+        print(f"  \x1b[2m{dt or '          '}\x1b[0m  {title}  \x1b[2m{path}\x1b[0m")
+
+    parked = [p for p in MEMORY.rglob("*") if p.is_file() and "_to_delete" in p.parts]
+    if parked:
+        print(f"\n\x1b[1mto_delete\x1b[0m  {len(parked)} file(s) parked, yours to remove")
+        for p in parked[:10]:
+            print(f"  \x1b[2m{p.relative_to(ROOT)}\x1b[0m")
+
+    last_daily = db.execute("SELECT date FROM fts WHERE type='daily' ORDER BY date DESC LIMIT 1").fetchone()
+    print("\n\x1b[1mfreshness\x1b[0m")
+    if last_daily and last_daily[0]:
+        try:
+            gap = (today() - date.fromisoformat(last_daily[0])).days
+            print(f"  last daily note   {last_daily[0]}  ({gap} day(s) ago)")
+        except ValueError:
+            print(f"  last daily note   {last_daily[0]}")
+    else:
+        print("  last daily note   none yet")
+    last_meeting = db.execute("SELECT date, title FROM fts WHERE type='meeting' ORDER BY date DESC LIMIT 1").fetchone()
+    if last_meeting:
+        print(f"  last meeting      {last_meeting[0]}  {last_meeting[1]}")
+    print(f"  index built       {indexed_at[0] if indexed_at else 'never'}")
+
+    profile = MEMORY / "profile.md"
+    if profile.exists():
+        todos = len(re.findall(r"TODO", profile.read_text(encoding="utf-8")))
+        if todos:
+            print(f"  profile TODOs     {todos}  (memory/profile.md, the weekly review asks one a week)")
+
+    dangling = db.execute(
+        "SELECT DISTINCT dst FROM links WHERE dst NOT IN (SELECT path FROM fts) ORDER BY dst LIMIT 15"
+    ).fetchall()
+    if dangling:
+        print(f"\n\x1b[1mnotes referenced but not written\x1b[0m ({len(dangling)} shown)")
+        for (dst,) in dangling:
+            print(f"  {dst}")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# recent
+# --------------------------------------------------------------------------
+
+def cmd_recent(args) -> int:
+    db = fresh_db()
+    sql = "SELECT path, type, date, title FROM fts WHERE date != ''"
+    params: list = []
+    if args.type:
+        sql += " AND type = ?"
+        params.append(args.type)
+    if args.days:
+        since = (today() - timedelta(days=args.days)).isoformat()
+        sql += " AND date >= ?"
+        params.append(since)
+    sql += " ORDER BY date DESC LIMIT ?"
+    params.append(args.limit)
+    for path, typ, dt, title in db.execute(sql, params).fetchall():
+        print(f"\x1b[2m{dt}\x1b[0m  \x1b[1m{title}\x1b[0m  \x1b[2m({typ}) {path}\x1b[0m")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# daily-note helpers shared by health, close, repeats, carried
+# --------------------------------------------------------------------------
+
+def daily_path(d: date) -> Path:
+    return MEMORY / "daily" / f"{d.isoformat()}.md"
+
+
+def _daily_sections(path: Path) -> dict[str, str]:
+    """Split a daily note into its `## ` sections, template comments removed."""
+    if not path.exists():
+        return {}
+    _, body = parse_frontmatter(path.read_text(encoding="utf-8"))
+    return sections_of(strip_scaffolding(body))
+
+
+def daily_notes(days: int) -> list[tuple[date, Path]]:
+    """Daily notes from the last N days, oldest first. Only files named by date."""
+    since = today() - timedelta(days=days)
+    out = []
+    for path in sorted((MEMORY / "daily").glob("*.md")):
+        m = re.match(r"(\d{4}-\d{2}-\d{2})$", path.stem)
+        if not m:
+            continue
+        try:
+            d = date.fromisoformat(m.group(1))
+        except ValueError:
+            continue
+        if d >= since:
+            out.append((d, path))
+    return out
+
+
+MARK = re.compile(r"<!--\s*(gmail|hespia|hespia-msg|proposed):([A-Za-z0-9_-]+)\s*-->")
+PROPOSED_BARE = re.compile(r"<!--\s*proposed\s*-->")
+RAN = re.compile(r"<!--\s*ran:\s*(brief|evening|review|plan)\s+(\S+)\s+(ok|failed|backfilled)(?:\s+([^>]*?))?\s*-->")
+BULLET = re.compile(r"^(\s*)(- \[[ x]\] |- |\* |\d+\. )(.*)$")
+BOLD_LEAD = re.compile(r"\*\*(.+?)\*\*")
+
+
+def item_key(text: str) -> str:
+    """A stable key for a brief bullet: its first tag id, else its bold lead, else
+    its first six words. Used to see the same item across days."""
+    m = MARK.search(text)
+    if m:
+        return f"{m.group(1)}:{m.group(2)}"
+    b = BOLD_LEAD.search(text)
+    if b:
+        return "lead:" + slugify(b.group(1))[:60]
+    words = re.findall(r"\w+", re.sub(r"<!--.*?-->", "", text).lower())
+    return "text:" + "-".join(words[:6])
+
+
+def bullets_in(text: str) -> list[str]:
+    """Bullets with their continuation lines joined, from a section's text."""
+    items: list[list[str]] = []
+    for line in text.splitlines():
+        if BULLET.match(line) and not line.startswith(("  ", "\t")):
+            items.append([line])
+        elif items and line.startswith((" ", "\t")) and line.strip():
+            items[-1].append(line)
+        elif not line.strip():
+            continue
+        else:
+            items.append([])  # a paragraph or heading breaks the bullet
+    return [" ".join(x.strip() for x in it) for it in items if it]
+
+
+# --------------------------------------------------------------------------
+# health — did the routines run?
+# --------------------------------------------------------------------------
+
+BRIEF_WORD_CAP = 700
+
+
+def count_dashes(text: str) -> int:
+    return text.count(EM_DASH)
+
+
+def prose_word_count(text: str) -> int:
+    """Words against the cap. Id tags (gmail/hespia/proposed) are metadata he
+    never reads, not prose, and must not count against the 700-word budget."""
+    stripped = MARK.sub("", text)
+    stripped = PROPOSED_BARE.sub("", stripped)
+    return len(stripped.split())
+
+
+def draft_ready_untagged(text: str) -> int:
+    """"draft ready" on a bullet with no gmail tag is a claim nothing can check."""
+    n = 0
+    for b in bullets_in(text):
+        if re.search(r"draft (is )?ready", b, re.I) and not re.search(r"<!--\s*gmail:", b):
+            n += 1
+    return n
+
+
+def cmd_health(args) -> int:
+    """One row per day: did each routine leave its trace.
+
+    A routine writes `<!-- ran: evening 2026-09-21T19:02+00:00 ok -->` at its end
+    (or `failed <reason>`, or `backfilled <date>`). When a note has markers, only
+    markers count. Older notes fall back to the section heading and are shown with
+    a `*`, meaning "heading present, run not proven".
+
+    Weekends are shown but never flagged. Today's evening is never flagged. Today's
+    brief is not flagged either, since the morning routine runs this before writing
+    it. The word cap and the dash count are checked every day, today included.
+    """
+    td = today()
+    gaps: list[str] = []
+    print(f"\x1b[1mroutines\x1b[0m  last {args.days} day(s)  ·  brief cap {BRIEF_WORD_CAP} words  ·  * = heading only, no run marker")
+    print("  date        day  brief       dashes  evening  review  carried")
+    for i in range(args.days - 1, -1, -1):
+        d = td - timedelta(days=i)
+        path = daily_path(d)
+        raw = path.read_text(encoding="utf-8") if path.exists() else ""
+        secs = _daily_sections(path)
+        brief = secs.get("brief", "").strip()
+        log = secs.get("log", "").strip()
+        carried = secs.get("carried forward", "").strip()
+        weekday = d.weekday() < 5
+        friday = d.weekday() == 4
+        words = prose_word_count(brief) if brief else 0
+        dashes = count_dashes(brief)
+        untagged = draft_ready_untagged(brief)
+
+        markers = {m.group(1): (m.group(3), (m.group(4) or "").strip()) for m in RAN.finditer(raw)}
+
+        def state(kind: str, heading: str) -> str:
+            if kind in markers:
+                st, note = markers[kind]
+                return {"ok": "yes", "failed": "FAIL", "backfilled": "bf"}[st]
+            return "yes*" if heading in log.lower() else "-"
+
+        evening = state("evening", "### evening processing")
+        review = state("review", "### weekly review")
+        plan = state("plan", "### weekly plan")
+        saturday = d.weekday() == 5
+
+        flags: list[str] = []
+        if weekday and d != td and not brief:
+            flags.append("no brief")
+        if weekday and d != td:
+            if evening == "-":
+                flags.append("no evening run")
+            elif evening == "FAIL":
+                flags.append(f"evening failed: {markers['evening'][1] or 'no reason given'}")
+            elif evening == "bf":
+                flags.append(f"evening backfilled {markers['evening'][1]}".rstrip())
+        if friday and d != td and review == "-":
+            flags.append("no weekly review")
+        if saturday and d != td and d >= PLAN_SINCE and plan == "-":
+            flags.append("no weekly plan")
+        if words > BRIEF_WORD_CAP:
+            flags.append(f"brief over cap by {words - BRIEF_WORD_CAP}")
+        if dashes:
+            flags.append(f"{dashes} em dash(es) in brief")
+        if untagged:
+            flags.append(f"{untagged} 'draft ready' with no gmail tag")
+
+        day = d.strftime("%a")
+        brief_col = f"{words:>4} words" if brief else "     -    "
+        dash_col = f"{dashes:>3}" if brief else "  -"
+        car_col = "yes" if carried else "-"
+        rev_col = review if friday or review != "-" else " "
+        if saturday and plan != "-":
+            rev_col = "plan" if plan == "yes" else plan
+        mark = "  \x1b[31m" + ", ".join(flags) + "\x1b[0m" if flags else ""
+        dim = "" if weekday else "\x1b[2m"
+        print(f"  {dim}{d.isoformat()}  {day}  {brief_col}  {dash_col:>6}  {evening:<7}  {rev_col:<6}  {car_col:<7}{mark}\x1b[0m")
+        for f in flags:
+            gaps.append(f"{d.isoformat()} {day}: {f}")
+
+    if gaps:
+        print(f"\n\x1b[1m{len(gaps)} gap(s)\x1b[0m")
+        for g in gaps:
+            print(f"  {g}")
+    else:
+        print("\nno gaps")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# close — strike brief items the outside world has answered
+# --------------------------------------------------------------------------
+
+# "replied" is a fact from Sent. "ticked" is a fact from Hespia. Neither means the
+# thing someone else owed has landed. Do not write "done".
+CLOSE_VERB = {"gmail": "replied", "hespia": "ticked"}
+CLOSEABLE = {"gmail", "hespia"}
+
+
+def find_bullet_start(lines: list[str], i: int) -> int:
+    """Walk back from a tagged line to the bullet it belongs to. Stop at a
+    heading, a fence, a blank line, or a line less indented than the tag line
+    that is not a bullet. Return -1 when there is no bullet above."""
+    tag_indent = len(lines[i]) - len(lines[i].lstrip())
+    start = i
+    while start >= 0:
+        line = lines[start]
+        if BULLET.match(line):
+            return start
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or stripped.startswith("```"):
+            return -1
+        indent = len(line) - len(line.lstrip())
+        if start != i and indent < tag_indent:
+            return -1
+        if indent == 0 and start != i:
+            return -1
+        start -= 1
+    return -1
+
+
+def cmd_close(args) -> int:
+    """Strike every bullet in recent daily notes tagged `<!-- gmail:ID -->` or
+    `<!-- hespia:ID -->` for the ids given.
+
+    The morning brief tags items that came from a Gmail thread or got a Hespia task.
+    The evening run collects thread ids from Sent and ticked task ids from Hespia and
+    passes them here. Striking is deterministic, so it lives in code. Nothing is
+    deleted; the line is wrapped in ~~ ~~ and dated. Ids that match nothing are
+    printed, so a wrong id is visible in the run's trace.
+    """
+    ids = {("gmail", i) for i in args.gmail or []}
+    ids |= {("hespia", i) for i in args.hespia or []}
+    if not ids:
+        print("nothing to close: pass --gmail and/or --hespia")
+        return 1
+    stamp = args.date or today().isoformat()
+    total = 0
+    matched: set[tuple[str, str]] = set()
+    for d, path in daily_notes(args.days):
+        lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+        changed = False
+        for i, line in enumerate(lines):
+            # a line can carry both a gmail and a hespia tag; check every one
+            mm = next((m for m in MARK.finditer(line) if (m.group(1), m.group(2)) in ids), None)
+            if not mm:
+                continue
+            matched.add((mm.group(1), mm.group(2)))
+            if "~~" in line:
+                continue
+            verb = CLOSE_VERB[mm.group(1)]
+            start = find_bullet_start(lines, i)
+            if start < 0:
+                print(f"  skipped: tag not under a bullet  {path.relative_to(ROOT)}:{i + 1}", file=sys.stderr)
+                continue
+            if "~~" in lines[start]:
+                continue
+            bm = BULLET.match(lines[start])
+            indent, prefix, body = bm.groups()
+            prefix = prefix.replace("[ ]", "[x]")
+            head = line[:mm.start()].rstrip()
+            if start == i:
+                hb = BULLET.match(head)
+                text = hb.group(3).rstrip() if hb else ""
+                new_line = f"{indent}{prefix}~~{text}~~ {verb} {stamp} {line[mm.start():]}"
+                if args.dry_run:
+                    print(f"  would strike  {path.relative_to(ROOT)}:{i + 1}  {text[:72]}")
+                else:
+                    lines[i] = new_line
+            else:
+                if args.dry_run:
+                    print(f"  would strike  {path.relative_to(ROOT)}:{start + 1}  {body[:72]}")
+                else:
+                    lines[start] = f"{indent}{prefix}~~{body}\n"
+                    if head.strip():
+                        lines[i] = f"{head}~~ {verb} {stamp} {line[mm.start():]}"
+                    else:
+                        # The tag sits alone on its line. Close the strike on the
+                        # line above, so it renders, and leave the tag line as is.
+                        j = i - 1
+                        while j > start and not lines[j].strip():
+                            j -= 1
+                        lines[j] = lines[j].rstrip("\n") + f"~~ {verb} {stamp}\n"
+            changed = True
+            total += 1
+            if not args.dry_run:
+                print(f"  {path.relative_to(ROOT)}  {(body if start != i else text)[:72]}")
+        if changed and not args.dry_run:
+            path.write_text("".join(lines), encoding="utf-8")
+    for kind, ident in sorted(ids - matched):
+        print(f"  not found: {kind}:{ident}")
+    print(f"{total} item(s) {'would be ' if args.dry_run else ''}closed")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# chases — the ledger of what is owed, both ways
+# --------------------------------------------------------------------------
+
+CHASE_STALE_DAYS = 5
+DUE_SOON_DAYS = 14
+ASK_WORDS = r"(?:asked|open since|open as of|chased|promised|said|raised|sent|since)"
+ASK_RE = re.compile(ASK_WORDS + r"[^·\n]{0,40}?~?(\d{4}-\d{2}-\d{2})", re.I)
+DUE_RE = re.compile(r"\bdue\s+(\d{4}-\d{2}-\d{2})", re.I)
+PARKED_RE = re.compile(r"\bparked till\s+(\d{4}-\d{2}-\d{2})", re.I)
+OWNER_RE = re.compile(r"^\s*\*\*(.+?)\*\*")
+
+
+def age_days(d: str) -> int:
+    try:
+        return (today() - date.fromisoformat(d)).days
+    except ValueError:
+        return -1
+
+
+def owner_names(owner: str) -> list[str]:
+    """"Engineering (Ada)" -> ["Ada"]. "Grace / backend" -> ["Grace", "backend"]."""
+    inner = re.findall(r"\(([^)]+)\)", owner)
+    base = inner[0] if inner else owner
+    parts = re.split(r"\s*(?:/|\+|,|&| and )\s*", base)
+    return [p.strip() for p in parts if p.strip()]
+
+
+def parse_chases() -> list[dict]:
+    """Every item in memory/chases.md, open and struck. Deterministic fields only."""
+    path = MEMORY / "chases.md"
+    if not path.exists():
+        return []
+    _, body = parse_frontmatter(path.read_text(encoding="utf-8"))
+    body = strip_scaffolding(body)
+    items: list[dict] = []
+    section = ""
+    cur: list[str] | None = None
+    cur_open = True
+    cur_line = 0
+
+    def flush():
+        nonlocal cur
+        if cur is None:
+            return
+        text = " ".join(x.strip() for x in cur)
+        clean = text.replace("~~", "")
+        dates = DATE_RE.findall(clean)
+        cap = today().isoformat()
+        past = [x for x in dates if x <= cap]
+        future = [x for x in dates if x > cap]
+        m = PARKED_RE.search(clean)
+        parked = m.group(1) if m else ""
+        future = [x for x in future if x != parked]
+        m = ASK_RE.search(clean)
+        asked = m.group(1) if m else (past[0] if past else "")
+        m = DUE_RE.search(clean)
+        due = m.group(1) if m else (min(future) if future else "")
+        m = OWNER_RE.search(clean)
+        owner = m.group(1).strip() if m else ""
+        items.append({
+            "section": section, "text": clean, "open": cur_open, "line": cur_line,
+            "owner": owner, "names": owner_names(owner) if owner else [],
+            "asked": asked, "due": due, "parked": parked,
+            "links": WIKILINK.findall(clean),
+        })
+        cur = None
+
+    for n, line in enumerate(body.splitlines(), 1):
+        if line.startswith("## "):
+            flush()
+            section = line[3:].strip()
+            continue
+        if line.startswith("- [ ]") or line.startswith("- [x]"):
+            flush()
+            cur = [line[5:]]
+            cur_open = line.startswith("- [ ]")
+            cur_line = n
+        elif cur is not None and line.startswith((" ", "\t")) and line.strip():
+            cur.append(line)
+        else:
+            flush()
+    flush()
+    return items
+
+
+def _chase_matches(it: dict, who: str) -> bool:
+    w = who.lower()
+    return w in it["owner"].lower() or any(w in n.lower() for n in it["names"]) or w in it["text"].lower()
+
+
+def _chase_row(it: dict, width: int = 90) -> str:
+    a = age_days(it["asked"])
+    text = re.sub(r"\*\*", "", it["text"])
+    head = text[:width] + ("…" if len(text) > width else "")
+    due_col = f"  due {it['due']} ({-age_days(it['due'])}d)" if it["due"] else ""
+    if it["parked"] and it["parked"] > today().isoformat():
+        return f"  \x1b[2m  p  parked till {it['parked']}\x1b[0m  {head}{due_col}"
+    if a < 0:
+        return f"    ?  no date   {head}{due_col}"
+    flag = a >= CHASE_STALE_DAYS
+    mark = "\x1b[31m" if flag else "\x1b[2m"
+    return f"{mark}{a:>3}d  {it['asked']}\x1b[0m  {head}{due_col}"
+
+
+def cmd_chases(args) -> int:
+    """List open chase-ledger items with their age, oldest first, stale ones flagged.
+
+    An item is a `- [ ]` bullet plus its indented continuation lines. Its ask date is
+    the first date after "asked", "open since", "chased" or a similar word, else the
+    first past date in the item. `due YYYY-MM-DD` names a deadline; `parked till
+    YYYY-MM-DD` pauses the stale flag (someone is on leave). The owner is the bold
+    lead. Counting, ageing and grouping are deterministic, so they live here.
+    """
+    items = parse_chases()
+    if not items:
+        print("no memory/chases.md")
+        return 1
+    done = sum(1 for it in items if not it["open"])
+    items = [it for it in items if it["open"]]
+    if args.mine:
+        items = [it for it in items if it["section"].lower().startswith("you owe")]
+    if args.who:
+        items = [it for it in items if _chase_matches(it, args.who)]
+
+    if args.lint:
+        bad = 0
+        for it in items:
+            probs = []
+            if not it["asked"]:
+                probs.append("no ask date")
+            if not it["links"]:
+                probs.append("no wikilink")
+            if not it["owner"] or re.search(r"unknown|not returned|\(DM\)", it["owner"], re.I):
+                probs.append("owner unknown")
+            if probs:
+                bad += 1
+                clean_text = re.sub(r"\*\*", "", it["text"])[:70]
+                print(f"  chases.md:{it['line']:<4} {', '.join(probs):<32} {clean_text}")
+        print(f"{bad} of {len(items)} open item(s) need fixing")
+        return 0
+
+    if args.by == "person":
+        groups: dict[str, list[dict]] = {}
+        for it in items:
+            for n in it["names"] or ["(no owner)"]:
+                groups.setdefault(n, []).append(it)
+        for n, rows in sorted(groups.items(), key=lambda kv: -max(age_days(r["asked"]) for r in kv[1])):
+            oldest = max(age_days(r["asked"]) for r in rows)
+            secs = sorted({r["section"] for r in rows})
+            print(f"\x1b[1m{n}\x1b[0m  {len(rows)} open · oldest {oldest}d · {', '.join(secs)}")
+            for r in sorted(rows, key=lambda x: -age_days(x["asked"])):
+                print(f"    {_chase_row(r, 80)}")
+            print()
+        print(f"{len(items)} open across {len(groups)} people · {done} done")
+        return 0
+
+    td = today().isoformat()
+    soon = [it for it in items if it["due"] and age_days(it["due"]) >= -DUE_SOON_DAYS]
+    if soon and not args.who:
+        print(f"\x1b[1mDue soon\x1b[0m  (within {DUE_SOON_DAYS} days, or past)")
+        for it in sorted(soon, key=lambda x: x["due"]):
+            left = -age_days(it["due"])
+            mark = "\x1b[31m" if left <= 3 else ""
+            text = re.sub(r"\*\*", "", it["text"])
+            print(f"  {mark}{it['due']}  {'past' if left < 0 else str(left) + 'd'}\x1b[0m  {text[:84]}")
+        print()
+
+    stale = 0
+    for sec in sorted(set(x["section"] for x in items), key=lambda s: [x["section"] for x in items].index(s)):
+        rows = sorted((x for x in items if x["section"] == sec), key=lambda x: -age_days(x["asked"]))
+        print(f"\x1b[1m{sec}\x1b[0m  ({len(rows)} open)")
+        for it in rows:
+            a = age_days(it["asked"])
+            if a >= CHASE_STALE_DAYS and not (it["parked"] and it["parked"] > td):
+                stale += 1
+            print(f"  {_chase_row(it)}")
+        print()
+    print(f"{len(items)} open · {stale} older than {CHASE_STALE_DAYS} days · {done} done")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# repeats — the same brief item, day after day
+# --------------------------------------------------------------------------
+
+def cmd_repeats(args) -> int:
+    """Count how many consecutive briefs each item has appeared in. Keyed by tag
+    id, else bold lead. The brief skill uses the streak to change the item's
+    shape: three days becomes Decide today, fourteen goes to Friday."""
+    notes = [(d, p) for d, p in daily_notes(args.days)]
+    briefs = []
+    for d, p in notes:
+        brief = _daily_sections(p).get("brief", "")
+        if brief.strip():
+            briefs.append((d, [b for b in bullets_in(brief) if "~~" not in b]))
+    if not briefs:
+        print("no briefs in range")
+        return 0
+    streak: dict[str, dict] = {}
+    prev_day: date | None = None
+    for d, items in briefs:
+        for b in items:
+            k = item_key(b)
+            if k in streak and streak[k]["last"] == prev_day:
+                streak[k]["n"] += 1
+            else:
+                streak[k] = {"n": 1, "first": d}
+            streak[k]["last"] = d
+            streak[k]["text"] = b
+        prev_day = d
+    last_day = briefs[-1][0]
+    rows = [(k, v) for k, v in streak.items() if v["last"] == last_day]
+    rows.sort(key=lambda kv: -kv[1]["n"])
+    for k, v in rows:
+        if v["n"] < args.min:
+            continue
+        text = re.sub(r"<!--.*?-->", "", v["text"])
+        text = re.sub(r"\*\*", "", text).strip()
+        mark = "\x1b[31m" if v["n"] >= 3 else ""
+        print(f"  {mark}{v['n']:>2} briefs\x1b[0m  since {v['first']}  {text[:80]}  \x1b[2m{k}\x1b[0m")
+    print(f"{sum(1 for _, v in rows if v['n'] >= args.min)} item(s) in {args.min}+ consecutive briefs, as of {last_day}")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# closed — what got struck, and whether the thing actually landed
+# --------------------------------------------------------------------------
+
+def cmd_closed(args) -> int:
+    """Struck brief items from the last N days. A hespia strike that still has an
+    open chase line with the same bold lead is marked "ticked, chase still open":
+    the owner ticked the task, the thing someone else owed did not arrive."""
+    chases = [it for it in parse_chases() if it["open"]]
+    chase_leads = {slugify(it["owner"]) for it in chases if it["owner"]}
+    rows = []
+    for d, p in daily_notes(args.days):
+        for sec, text in _daily_sections(p).items():
+            for b in bullets_in(text):
+                if "~~" not in b:
+                    continue
+                m = re.search(r"~~\s*(replied|ticked|done|dropped)\s+(\d{4}-\d{2}-\d{2})", b)
+                verb, when = (m.group(1), m.group(2)) if m else ("struck", d.isoformat())
+                lead = BOLD_LEAD.search(b)
+                lead_slug = slugify(lead.group(1)) if lead else ""
+                flag = ""
+                if verb in ("ticked", "done") and lead_slug and any(lead_slug in c or c in lead_slug for c in chase_leads if c):
+                    flag = "ticked, chase still open"
+                rows.append((when, verb, sec, re.sub(r"\*\*|~~", "", re.sub(r"<!--.*?-->", "", b)).strip()[:80], flag, str(p.relative_to(ROOT))))
+    for when, verb, sec, text, flag, path in sorted(rows):
+        mark = "\x1b[31m" if flag else ""
+        print(f"  {when}  {verb:<8} {text}  \x1b[2m{sec} {path}\x1b[0m{'  ' + mark + flag + chr(27) + '[0m' if flag else ''}")
+    print(f"{len(rows)} struck item(s) in {args.days} day(s) · {sum(1 for r in rows if r[4])} with an open chase")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# carried — what is still open in recent briefs, for tomorrow's note
+# --------------------------------------------------------------------------
+
+def cmd_carried(args) -> int:
+    """Unstruck bullets from Needs you, Chasing and Carried forward in the last N
+    days, deduped by tag then bold lead, tags kept. First-seen date gives the age."""
+    first: dict[str, tuple[date, str]] = {}
+    latest: dict[str, str] = {}
+    for d, p in daily_notes(args.days):
+        secs = _daily_sections(p)
+        text = secs.get("brief", "") + "\n" + secs.get("carried forward", "")
+        # only the brief's needs-you, chasing and carried blocks, not meeting cards
+        keep = []
+        take = False
+        for line in text.splitlines():
+            if line.startswith("### "):
+                h = line.lower()
+                take = any(k in h for k in ("needs you", "chasing", "carried", "decide", "due", "you owe"))
+                continue
+            if line.startswith("## "):
+                take = True
+                continue
+            if take:
+                keep.append(line)
+        for b in bullets_in("\n".join(keep)):
+            if "~~" in b:
+                continue
+            k = item_key(b)
+            first.setdefault(k, (d, b))
+            latest[k] = b
+    rows = sorted(first.items(), key=lambda kv: kv[1][0])
+    for k, (d, _) in rows:
+        b = latest[k]
+        print(f"- [ ] {b}  ({age_days(d.isoformat())}d)" if not b.startswith("- ") else f"{b}  ({age_days(d.isoformat())}d)")
+    print(f"\n{len(rows)} open item(s), oldest first", file=sys.stderr)
+    return 0
+
+
+# --------------------------------------------------------------------------
+# top3 — the day's three, and how the week went
+# --------------------------------------------------------------------------
+
+TOP3_SINCE = date(2026, 9, 24)   # the Top 3 rule starts here; earlier briefs are not gaps
+PLAN_SINCE = date(2026, 9, 27)   # first Saturday plan
+TOP3_VERDICT = re.compile(r"^\s*(?:-|\d+\.)\s*(done|open|not found)\b", re.IGNORECASE)
+
+
+def _block_after(text: str, heading: str) -> str:
+    """Lines under a `### <heading>` up to the next heading of any level."""
+    out: list[str] = []
+    take = False
+    for line in text.splitlines():
+        if line.startswith("#"):
+            if take:
+                break
+            take = line.lstrip("#").strip().lower() == heading
+            continue
+        if take:
+            out.append(line)
+    return "\n".join(out)
+
+
+def cmd_top3(args) -> int:
+    """The Top 3 from each brief in the last N days, with the evening's verdict
+    per task. The morning writes `### Top 3` in the brief, three items each
+    tagged `<!-- hespia:ID -->`. The evening writes `### Top 3 review` in the
+    Log, one bullet per task starting with done, open or not found, same tag.
+
+    Prints one row per day, then per task: days in the Top 3, done or still
+    open, and a flag when it has sat three or more days undone. Days that had
+    a brief and no Top 3, or a Top 3 and no review, are named. Friday reads
+    this. Nothing here is counted by eye."""
+    td = today()
+    days: list[dict] = []
+    per_task: dict[str, dict] = {}
+    for d, p in daily_notes(args.days):
+        secs = _daily_sections(p)
+        brief = secs.get("brief", "")
+        log = secs.get("log", "")
+        if not brief.strip() or d.weekday() >= 5 or d < TOP3_SINCE:
+            continue
+        picks = []
+        for b in bullets_in(_block_after(brief, "top 3")):
+            m = MARK.search(b)
+            if not m or m.group(1) != "hespia":
+                continue
+            lead = BOLD_LEAD.search(b)
+            text = lead.group(1) if lead else re.sub(r"<!--.*?-->|\*\*", "", b).strip()[:60]
+            text = text.rstrip(" .:,")
+            picks.append((m.group(2), text))
+        verdicts: dict[str, str] = {}
+        review = _block_after(log, "top 3 review")
+        for b in bullets_in(review):
+            m = MARK.search(b)
+            v = TOP3_VERDICT.match(b)
+            if m and m.group(1) == "hespia" and v:
+                verdicts[m.group(2)] = v.group(1).lower()
+        days.append({"date": d, "picks": picks, "verdicts": verdicts, "reviewed": bool(review.strip())})
+        for tid, text in picks:
+            t = per_task.setdefault(tid, {"text": text, "days": [], "done": None, "last": None})
+            t["days"].append(d)
+            t["last"] = verdicts.get(tid)
+            if verdicts.get(tid) == "done" and t["done"] is None:
+                t["done"] = d
+    if not days:
+        print(f"no briefs in the last {args.days} day(s)")
+        return 0
+    gaps: list[str] = []
+    for day in days:
+        d = day["date"]
+        if not day["picks"]:
+            gaps.append(f"{d} {d.strftime('%a')}: brief with no Top 3")
+            print(f"  {d}  {d.strftime('%a')}  no Top 3")
+            continue
+        if len(day["picks"]) != 3:
+            gaps.append(f"{d} {d.strftime('%a')}: {len(day['picks'])} in the Top 3, not 3")
+        if not day["reviewed"] and d != td:
+            gaps.append(f"{d} {d.strftime('%a')}: Top 3 never reviewed")
+        cells = []
+        for tid, text in day["picks"]:
+            v = day["verdicts"].get(tid, "?" if d != td else "today")
+            colour = {"done": "\x1b[32m", "open": "\x1b[33m", "not found": "\x1b[31m"}.get(v, "\x1b[2m")
+            cells.append(f"{colour}{v}\x1b[0m {text[:28]}")
+        print(f"  {d}  {d.strftime('%a')}  " + "  ·  ".join(cells))
+    slots = sum(len(day["picks"]) for day in days if day["date"] != td)
+    done_slots = sum(1 for day in days if day["date"] != td for tid, _ in day["picks"] if day["verdicts"].get(tid) == "done")
+    print()
+    rows = sorted(per_task.items(), key=lambda kv: (-len(kv[1]["days"]), kv[1]["days"][0]))
+    for tid, t in rows:
+        n = len(t["days"])
+        if t["done"]:
+            status = f"done {t['done']}"
+        elif t["last"] == "not found":
+            status = "not found on their list"
+        else:
+            status = "still open"
+        stuck = n >= 3 and not t["done"]
+        mark = "  \x1b[31mstuck\x1b[0m" if stuck else ""
+        print(f"  {n:>2} day(s)  {status:<18} {t['text'][:50]}  \x1b[2mhespia:{tid}\x1b[0m{mark}")
+    print()
+    print(f"{done_slots} of {slots} Top 3 slot(s) done · {len(per_task)} task(s) · {sum(1 for _, t in rows if len(t['days']) >= 3 and not t['done'])} stuck 3+ days · {len(gaps)} gap(s)")
+    for g in gaps:
+        print(f"  \x1b[31m{g}\x1b[0m")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# actions — open checkboxes in meeting notes
+# --------------------------------------------------------------------------
+
+def cmd_actions(args) -> int:
+    db = fresh_db()
+    rows = db.execute("SELECT path, date, title FROM fts WHERE type='meeting' ORDER BY date DESC").fetchall()
+    n = 0
+    person = (args.person or "").lower().replace("-", " ")
+    for path, dt, title in rows:
+        secs = sections_of(strip_scaffolding(parse_frontmatter((ROOT / path).read_text(encoding="utf-8"))[1]))
+        for sec, text in secs.items():
+            if "action" not in sec:
+                continue
+            for b in bullets_in(text):
+                is_open = b.startswith("- [ ]")
+                if args.open and not is_open:
+                    continue
+                if person and person not in b.lower().replace("-", " "):
+                    continue
+                n += 1
+                clean_b = re.sub(r"\*\*", "", b)[:90]
+                print(f"  {dt}  {clean_b}  \x1b[2m{path}\x1b[0m")
+    print(f"{n} action(s)")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# retire — the only way a library file leaves its folder
+# --------------------------------------------------------------------------
+
+def cmd_retire(args) -> int:
+    """Move a note into `_to_delete/` next to it. Never deletes. Never touches git.
+    The owner removes the parked file themself."""
+    p = Path(args.path)
+    if not p.is_absolute():
+        p = ROOT / p
+    try:
+        p.resolve().relative_to(MEMORY.resolve())
+    except ValueError:
+        print("retire only moves files inside memory/", file=sys.stderr)
+        return 1
+    if not p.exists():
+        print(f"no such file: {args.path}", file=sys.stderr)
+        return 1
+    park = p.parent / "_to_delete"
+    park.mkdir(exist_ok=True)
+    dest = park / p.name
+    if dest.exists():
+        dest = park / f"{p.stem}-{now().strftime('%Y%m%d-%H%M%S')}{p.suffix}"
+    os.rename(p, dest)
+    print(f"parked  {dest.relative_to(ROOT)}")
+    print("        yours to delete. The index ignores _to_delete/.")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# lint — the checks a person would do by eye, done by code
+# --------------------------------------------------------------------------
+
+STYLE_FILES = ["CLAUDE.md", "README.md", "memory/profile.md", "memory/improvements.md"]
+STALE_PROJECT_DAYS = 30
+THIN_PERSON_LINES = 4
+
+
+def lint_style(paths: list[Path]) -> int:
+    n = 0
+    for p in paths:
+        if not p.exists():
+            continue
+        for i, line in enumerate(p.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+            if EM_DASH in line:
+                n += 1
+                print(f"  {p.relative_to(ROOT)}:{i}  em dash  {line.strip()[:80]}")
+    return n
+
+
+def lint_structure(db: sqlite3.Connection) -> int:
+    n = 0
+    td = today().isoformat()
+    dangling = db.execute(
+        "SELECT DISTINCT dst FROM links WHERE dst NOT IN (SELECT path FROM fts) ORDER BY dst"
+    ).fetchall()
+    for (dst,) in dangling:
+        srcs = [r[0] for r in db.execute("SELECT DISTINCT src FROM links WHERE dst = ? LIMIT 3", (dst,))]
+        n += 1
+        print(f"  dangling link     {dst}  \x1b[2m<- {', '.join(srcs)}\x1b[0m")
+    for path, dt, upd, title in db.execute(
+        "SELECT path, date, updated, title FROM fts WHERE type='project'"
+    ).fetchall():
+        fm, body = parse_frontmatter((ROOT / path).read_text(encoding="utf-8"))
+        if fm.get("status") != "active":
+            continue
+        log_dates = DATE_RE.findall(sections_of(body).get("log", ""))
+        last = max((d for d in log_dates if d <= td), default=dt)
+        if last and age_days(last) > STALE_PROJECT_DAYS:
+            n += 1
+            print(f"  stale project     {path}  last log {last} ({age_days(last)}d)")
+        m = re.search(r"_As of (\d{4}-\d{2}-\d{2}):_", body)
+        if m and last and m.group(1) < last:
+            n += 1
+            print(f"  as-of behind log  {path}  as of {m.group(1)}, log {last}")
+    for (path,) in db.execute("SELECT path FROM fts WHERE type='topic' ORDER BY path").fetchall():
+        st = topic_state(db, path)
+        if st["status"] != "done" and (st["changed"] or st["new"]):
+            n += 1
+            print(f"  stale topic       {path}  compiled {st['compiled']}, "
+                  f"{len(st['changed'])} source(s) changed, {len(st['new'])} new mention(s)")
+    for path, title in db.execute("SELECT path, title FROM fts WHERE type='person'").fetchall():
+        _, body = parse_frontmatter((ROOT / path).read_text(encoding="utf-8"))
+        real = [l for l in strip_scaffolding(body).splitlines() if l.strip() and not l.startswith("#")]
+        if len(real) <= THIN_PERSON_LINES:
+            n += 1
+            print(f"  thin person file  {path}  {len(real)} line(s) of content")
+    for path, in db.execute("SELECT path FROM fts WHERE type IN ('person','company','project')").fetchall():
+        _, body = parse_frontmatter((ROOT / path).read_text(encoding="utf-8"))
+        seen: set[str] = set()
+        for line in sections_of(body).get("log", "").splitlines() + sections_of(body).get("history", "").splitlines():
+            key = line.strip()
+            if key.startswith("-") and key in seen:
+                n += 1
+                print(f"  duplicate line    {path}  {key[:70]}")
+                break
+            seen.add(key)
+    return n
+
+
+# Failure modes seen in real runs, each turned into a check. Added 2026-09-28 at
+# From the evals-skills repo: a known mistake gets code,
+# not another reminder in a skill.
+
+NAME_PAIR = re.compile(r"\b([A-Z][a-z]{2,}) ([A-Z][a-z]{2,})\b")
+STRUCK = re.compile(r"~~.*?~~")
+# The ledger quotes misspellings on purpose. Checking it would flag its own examples.
+NAME_SKIP = {"memory/improvements.md"}
+
+
+def _edits(a: str, b: str) -> int:
+    """Levenshtein distance. Names are short, so the plain table is fine."""
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[-1]
+
+
+def _near(a: str, b: str) -> bool:
+    """One letter off for short names, two for names of five letters or more.
+    Lovelass vs Lovelace is two."""
+    if a == b:
+        return False
+    return _edits(a.lower(), b.lower()) <= (2 if min(len(a), len(b)) >= 5 else 1)
+
+
+def lint_names(db: sqlite3.Connection) -> int:
+    """A full name in a note that is one or two letters off a person file's name,
+    with the other half exact. "Ada Lovelass" when the file is ada-lovelace.md."""
+    people = []
+    for path, title in db.execute("SELECT path, title FROM fts WHERE type='person'").fetchall():
+        toks = re.sub(r"\(.*?\)", "", title).split()
+        if len(toks) >= 2:
+            people.append((path, toks))
+    exact = {f"{t[i]} {t[i + 1]}" for _, t in people for i in range(len(t) - 1)}
+    hits: dict[tuple[str, str], list[str]] = {}
+    for p in md_files():
+        rel = str(p.relative_to(ROOT))
+        if rel in NAME_SKIP:
+            continue
+        text = STRUCK.sub("", strip_code(p.read_text(encoding="utf-8", errors="replace")))
+        for para in re.split(r"\n\s*\n", text):
+            for m in NAME_PAIR.finditer(para):
+                a, b = m.groups()
+                if f"{a} {b}" in exact:
+                    continue
+                for path, toks in people:
+                    first, last = toks[0], toks[-1]
+                    if (a == first and _near(b, last)) or (b == last and _near(a, first)):
+                        # A paragraph that also has the right name is a correction
+                        # note ("The name was never Sam. It is Pam."), not the error.
+                        right = last if a == first else first
+                        if not re.search(rf"\b{re.escape(right)}\b", para):
+                            hits.setdefault((f"{a} {b}", path), []).append(rel)
+    for (name, path), files in sorted(hits.items()):
+        where = sorted(set(files))
+        more = f" +{len(where) - 3} more" if len(where) > 3 else ""
+        print(f"  name off by a letter  \"{name}\" x{len(files)}, file is {path}  "
+              f"\x1b[2m{', '.join(where[:3])}{more}\x1b[0m")
+    return len(hits)
+
+
+def _task_ids(path: str) -> set[str]:
+    """Every Hespia task id, done or open. A JSON dump of list_personal_tasks with
+    onlyOpen: false, or plain text with one id per line."""
+    raw = Path(path).read_text(encoding="utf-8")
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return {l.strip() for l in raw.splitlines() if l.strip()}
+    if isinstance(data, dict):
+        data = data.get("tasks") or data.get("data") or []
+    return {str(t.get("id")) if isinstance(t, dict) else str(t) for t in data}
+
+
+def lint_tags(task_file: str | None = None, days: int = 14) -> int:
+    """Hespia ids in the wrong kind of tag. A message id in a `hespia:` tag looks
+    like an open task forever, and a shortcut that treats missing as done would
+    strike it (near misses 09-15 and 09-16)."""
+    n = 0
+    kinds: dict[str, set[str]] = {}
+    for p in md_files():
+        for m in MARK.finditer(strip_code(p.read_text(encoding="utf-8", errors="replace"))):
+            kinds.setdefault(m.group(2), set()).add(m.group(1))
+    for ident, ks in sorted(kinds.items()):
+        if {"hespia", "hespia-msg"} <= ks:
+            n += 1
+            print(f"  id in both tags   {ident}  is a hespia: task and a hespia-msg: message. One is wrong")
+    if not task_file:
+        return n
+    known = _task_ids(task_file)
+    if not known:
+        print(f"  no task ids read from {task_file}. Skipped the task check")
+        return n
+    seen: set[str] = set()
+    for d, path in daily_notes(days):
+        for i, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            for m in MARK.finditer(line):
+                ident = m.group(2)
+                if m.group(1) != "hespia" or ident in known or ident == "ID" or "~~" in line or ident in seen:
+                    continue
+                seen.add(ident)
+                n += 1
+                print(f"  not a task id     hespia:{ident}  {path.relative_to(ROOT)}:{i}  "
+                      f"\x1b[2mnot in the task list, done or open. A message id or a deleted task\x1b[0m")
+    return n
+
+
+def cmd_lint(args) -> int:
+    both = not (args.style or args.structure)
+    total = 0
+    if args.style or both:
+        paths = [ROOT / p for p in STYLE_FILES]
+        paths += sorted((ROOT / "skills").glob("*/SKILL.md")) + sorted((ROOT / "templates").glob("*.md"))
+        paths += sorted((ROOT / "routines").glob("*.md"))
+        paths += sorted((MEMORY / "topics").glob("*.md"))
+        paths.append(daily_path(today()))
+        if args.path:
+            paths = [ROOT / p if not Path(p).is_absolute() else Path(p) for p in args.path]
+        print("\x1b[1mstyle\x1b[0m")
+        total += lint_style(paths)
+    if (args.structure or both) and not args.path:
+        print("\x1b[1mstructure\x1b[0m")
+        db = fresh_db()
+        total += lint_structure(db)
+        print("\x1b[1mknown mistakes\x1b[0m")
+        total += lint_names(db)
+        total += lint_tags(args.tasks)
+    print(f"{total} finding(s)")
+    return 1 if total and args.strict else 0
+
+
+# --------------------------------------------------------------------------
+# priorities — days since each stated priority was touched
+# --------------------------------------------------------------------------
+
+def cmd_priorities(args) -> int:
+    """Read the numbered list under "What I'm working on" in memory/profile.md.
+    For each, the newest date on any note it links, or any note linking those.
+    The brief prints one line: "P1: last touched 10d"."""
+    profile = MEMORY / "profile.md"
+    if not profile.exists():
+        print("no memory/profile.md")
+        return 1
+    _, body = parse_frontmatter(profile.read_text(encoding="utf-8"))
+    sec = sections_of(strip_scaffolding(body)).get("what i'm working on", "")
+    items = []
+    for b in bullets_in(sec):
+        m = re.match(r"\d+\.\s*(.*)", b)
+        if m:
+            items.append(m.group(1))
+    if not items:
+        print("no numbered priorities in profile.md")
+        return 1
+    db = fresh_db()
+    td = today().isoformat()
+    for n, text in enumerate(items, 1):
+        targets = [resolve_link(t) for t in WIKILINK.findall(text)]
+        best = ""
+        best_path = ""
+        for t in targets:
+            # "Touched" means a meeting happened or the project's own log moved.
+            # A mention in a brief is the routine talking, not the owner working on it.
+            tp = ROOT / t
+            if tp.exists():
+                _, tbody = parse_frontmatter(tp.read_text(encoding="utf-8"))
+                secs = sections_of(strip_scaffolding(tbody))
+                for d in DATE_RE.findall(secs.get("log", "") + secs.get("history", "")):
+                    if d <= td and d > best:
+                        best, best_path = d, t
+            for src, dt in db.execute(
+                "SELECT l.src, f.date FROM links l JOIN fts f ON f.path = l.src "
+                "WHERE l.dst = ? AND f.type = 'meeting'", (t,)
+            ).fetchall():
+                if dt and dt <= td and dt > best:
+                    best, best_path = dt, src
+        lead = BOLD_LEAD.search(text)
+        label = lead.group(1) if lead else text[:40]
+        if best:
+            a = age_days(best)
+            mark = "\x1b[31m" if a > 7 else ""
+            print(f"  P{n}  {mark}{a:>3}d\x1b[0m  {label}  \x1b[2m{best} {best_path}\x1b[0m")
+        else:
+            print(f"  P{n}    ?   {label}  \x1b[2mno linked notes\x1b[0m")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# decisions — which ones are due a look
+# --------------------------------------------------------------------------
+
+DECISION_REVIEW_DAYS = 90
+
+
+def cmd_decisions(args) -> int:
+    db = fresh_db()
+    td = today()
+    rows = db.execute("SELECT path, date, title FROM fts WHERE type='decision' ORDER BY date").fetchall()
+    n = 0
+    for path, dt, title in rows:
+        fm, body = parse_frontmatter((ROOT / path).read_text(encoding="utf-8"))
+        outcome = sections_of(strip_scaffolding(body)).get("outcome", "").strip()
+        revisit = str(fm.get("revisit", "")).strip()
+        reasons = []
+        if revisit:
+            try:
+                left = (date.fromisoformat(revisit) - td).days
+                if left <= 7:
+                    reasons.append(f"revisit {revisit} ({'past' if left < 0 else str(left) + 'd'})")
+            except ValueError:
+                reasons.append(f"bad revisit date '{revisit}'")
+        if not outcome and dt and age_days(dt) >= DECISION_REVIEW_DAYS:
+            reasons.append(f"no outcome after {age_days(dt)}d")
+        if args.due and not reasons:
+            continue
+        n += 1
+        status = ", ".join(reasons) if reasons else ("outcome recorded" if outcome else "open")
+        print(f"  {dt}  {title[:60]}  \x1b[2m{status}\x1b[0m")
+    print(f"{n} decision(s){' due a look' if args.due else ''}")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# topics — compiled pages, and what moved underneath them since
+# --------------------------------------------------------------------------
+
+# Columns a topic mention is looked for in. Not `carried`: a brief repeating a
+# line for ten days is not ten new facts.
+TOPIC_COLUMNS = "{title body meta}"
+
+
+_TOUCHED: dict[str, float] | None = None
+
+
+def touched_times() -> dict[str, float]:
+    """repo-relative path -> when it last changed, from git. The last commit
+    time, or now for a file with uncommitted changes. Empty outside a git checkout.
+    Dates written inside a note miss a backfill: a meeting note written today
+    about 09-15 carries only 09-15. Git knows when the words arrived."""
+    global _TOUCHED
+    if _TOUCHED is not None:
+        return _TOUCHED
+    _TOUCHED = {}
+    log = _git("log", "--format=%x00%ct", "--name-only", "--", "memory")
+    ts = 0.0
+    for line in log.splitlines():
+        if line.startswith("\x00"):
+            ts = float(line[1:] or 0)
+        elif line.strip() and line not in _TOUCHED:
+            _TOUCHED[line] = ts
+    stamp = now().timestamp()
+    for line in _git("status", "--porcelain", "--untracked-files=all", "--", "memory").splitlines():
+        path = line[3:].strip().strip('"')
+        if " -> " in path:
+            path = path.split(" -> ", 1)[1]
+        _TOUCHED[path] = stamp
+    return _TOUCHED
+
+
+def topic_state(db: sqlite3.Connection, path: str) -> dict:
+    """What a topic page links, which of those moved since it was compiled, and
+    which newer notes name its title or an alias without being linked.
+    "Moved" means the source's newest written date is after `compiled:`, or git
+    saw it change after the topic page last did."""
+    fm, body = parse_frontmatter((ROOT / path).read_text(encoding="utf-8"))
+    compiled = str(fm.get("compiled") or fm.get("date") or "")[:10]
+    title = note_title(ROOT / path, fm, body)
+    aliases = fm.get("aliases") or []
+    if isinstance(aliases, str):
+        aliases = [a.strip() for a in aliases.split(",") if a.strip()]
+    sources = [
+        dst for (dst,) in db.execute("SELECT DISTINCT dst FROM links WHERE src = ? ORDER BY dst", (path,))
+        if (ROOT / dst).exists()
+    ]
+    updated = {p: u for p, u in db.execute("SELECT path, updated FROM fts WHERE type != 'topic'")}
+    touched = touched_times()
+    page_at = touched.get(path)
+
+    def moved(src: str) -> str:
+        """The date to show if src moved since the compile, else ''."""
+        upd = updated.get(src) or ""
+        if upd and compiled and upd > compiled:
+            return upd
+        at = touched.get(src)
+        if at and page_at and at > page_at:
+            return datetime.fromtimestamp(at, LOCAL_TZ).date().isoformat()
+        return ""
+
+    changed = sorted(
+        ((s, moved(s)) for s in sources if moved(s)), key=lambda x: x[1], reverse=True,
+    )
+    new: dict[str, str] = {}
+    linked = set(sources)
+    for term in [title] + list(aliases):
+        # A phrase, not a bag of words: "event tech" must not match every note
+        # that says "event" and, somewhere else, "tech".
+        words = re.sub(r"[^\w\s-]", " ", term, flags=re.UNICODE).split()
+        q = '"' + " ".join(words) + '"' if words else ""
+        if not q or not compiled:
+            continue
+        for (p,) in db.execute(
+            "SELECT path FROM fts WHERE fts MATCH ? AND type != 'topic'",
+            (f"{TOPIC_COLUMNS} : ({q})",),
+        ):
+            when = moved(p)
+            if p not in linked and when:
+                new[p] = when
+    return {
+        "path": path,
+        "title": title,
+        "status": str(fm.get("status") or "active"),
+        "compiled": compiled,
+        "aliases": aliases,
+        "sources": sources,
+        "changed": changed,
+        "new": sorted(new.items(), key=lambda x: x[1], reverse=True),
+    }
+
+
+def cmd_topics(args) -> int:
+    db = fresh_db()
+    rows = [p for (p,) in db.execute("SELECT path FROM fts WHERE type='topic' ORDER BY path")]
+    if args.topic:
+        want = args.topic.lower()
+        rows = [p for p in rows if want in Path(p).stem or want in p.lower()]
+        if not rows:
+            print(f"no topic matching '{args.topic}'. Create one: bin/brain new topic \"{args.topic}\"")
+            return 1
+    if args.gaps:
+        # The open gaps across every topic page: the to-do list for growing the
+        # library. Struck lines are closed.
+        total = 0
+        for path in rows:
+            fm, body = parse_frontmatter((ROOT / path).read_text(encoding="utf-8"))
+            gaps = [
+                g for g in bullets_in(sections_of(strip_scaffolding(body)).get("gaps", ""))
+                if not re.match(r"^[-*]\s*~~", g)
+            ]
+            if not gaps:
+                continue
+            print(f"\x1b[1m{note_title(ROOT / path, fm, body)}\x1b[0m  \x1b[2m{path}\x1b[0m")
+            for g in gaps:
+                print(f"  {g}")
+            total += len(gaps)
+        print(f"{total} open gap(s)")
+        return 0
+    shown = 0
+    for path in rows:
+        st = topic_state(db, path)
+        stale = st["status"] != "done" and bool(st["changed"] or st["new"])
+        if args.stale and not stale:
+            continue
+        shown += 1
+        age = age_days(st["compiled"]) if st["compiled"] else -1
+        mark = "\x1b[33m" if stale else ""
+        print(f"{mark}{st['title']}\x1b[0m  \x1b[2m{path}\x1b[0m")
+        print(f"  compiled {st['compiled'] or '?'} ({age}d)  {len(st['sources'])} source(s)  "
+              f"{len(st['changed'])} changed  {len(st['new'])} new mention(s)")
+        if args.topic or args.stale:
+            for s, u in st["changed"]:
+                print(f"    changed  {u}  {s}")
+            for s, u in st["new"]:
+                print(f"    new      {u}  {s}")
+    print(f"{shown} topic(s){' to refresh' if args.stale else ''}")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# meetings — which recordings still need to become memory
+# --------------------------------------------------------------------------
+
+# How the owner shows up in a Fathom invitee list or a calendar attendee.
+ME = (CONFIG.get("match") or CONFIG.get("name", "").split(" ")[0] or "owner").lower()
+STANDUP_RE = re.compile(r"stand\s*-?\s*up", re.I)
+SKIP_TITLE_RE = re.compile(r"^\s*impromptu\b", re.I)
+FATHOM_LINE = re.compile(
+    r"^-\s*(?P<title>.*?)\s*\|\s*(?P<date>\d{4}-\d{2}-\d{2})(?:\s+\d{2}:\d{2})?\s*\|\s*id:\s*(?P<id>\d+)"
+    r"\s*\|\s*url:\s*(?P<url>\S+)(?:\s*\|\s*recorded by\s*(?P<rec>[^|]*?))?(?:\s*\|\s*(?P<inv>.*))?\s*$"
+)
+CALL_ID_RE = re.compile(r"fathom\.video/(?:calls|share)/([\w-]+)")
+
+
+def parse_fathom(text: str) -> list[dict]:
+    """Fathom meetings from either the connector's text listing (one `- title |
+    date | id: N | url: U | recorded by R | invitees` line each) or JSON."""
+    text = text.strip()
+    out = []
+    if text.startswith(("[", "{")):
+        data = json.loads(text)
+        items = data if isinstance(data, list) else data.get("meetings") or data.get("items") or []
+        for m in items:
+            inv = m.get("calendar_invitees") or m.get("invitees") or []
+            inv = [i.get("name") or i.get("email", "") if isinstance(i, dict) else str(i) for i in inv]
+            rec = m.get("recorded_by") or ""
+            if isinstance(rec, dict):
+                rec = rec.get("name") or rec.get("email", "")
+            out.append({
+                "title": m.get("title") or m.get("meeting_title") or "",
+                "date": str(m.get("date") or m.get("created_at") or m.get("recording_start_time") or "")[:10],
+                "id": str(m.get("recording_id") or m.get("id") or ""),
+                "url": m.get("url") or m.get("share_url") or "",
+                "recorded_by": rec,
+                "invitees": inv,
+            })
+        return out
+    for line in text.splitlines():
+        m = FATHOM_LINE.match(line.strip())
+        if not m:
+            continue
+        inv = [i.strip() for i in (m.group("inv") or "").split(",") if i.strip()]
+        out.append({
+            "title": m.group("title").strip(), "date": m.group("date"), "id": m.group("id"),
+            "url": m.group("url"), "recorded_by": (m.group("rec") or "").strip(), "invitees": inv,
+        })
+    return out
+
+
+def parse_calendar(text: str) -> list[dict]:
+    """Calendar events that were real meetings with someone else: two or more
+    attendees, a start time, and not declined by the owner."""
+    data = json.loads(text)
+    events = data.get("events", []) if isinstance(data, dict) else data
+    out = []
+    for e in events:
+        start = (e.get("start") or {}).get("dateTime")
+        people = e.get("attendees") or []
+        if not start or len(people) < 2:
+            continue
+        if any(a.get("self") and a.get("responseStatus") == "declined" for a in people):
+            continue
+        if str(e.get("eventType", "default")).lower() not in ("default", ""):
+            continue
+        out.append({
+            "title": e.get("summary") or "(no title)",
+            "date": start[:10],
+            "time": start[11:16],
+            "attendees": [a.get("displayName") or a.get("email", "") for a in people if not a.get("self")],
+        })
+    return out
+
+
+def _topic_terms(db: sqlite3.Connection) -> list[tuple[str, str]]:
+    """(term, topic slug) for every live topic's title and aliases."""
+    terms = []
+    for (path,) in db.execute("SELECT path FROM fts WHERE type='topic'"):
+        fm, body = parse_frontmatter((ROOT / path).read_text(encoding="utf-8"))
+        if str(fm.get("status") or "") == "done":
+            continue
+        aliases = fm.get("aliases") or []
+        if isinstance(aliases, str):
+            aliases = [a.strip() for a in aliases.split(",") if a.strip()]
+        for t in [note_title(ROOT / path, fm, body)] + list(aliases):
+            if len(t) > 2:
+                terms.append((t.lower(), Path(path).stem))
+    return terms
+
+
+def _filed(m: dict, library: str, notes: dict[str, list[str]]) -> str:
+    """Where this recording already landed, or ''. A Fathom call id or recording
+    id anywhere in the library counts. So does a meeting note on the same date
+    with a close title, for notes whose source is a share link."""
+    cid = CALL_ID_RE.search(m["url"] or "")
+    for needle in filter(None, [cid.group(1) if cid else "", m["id"]]):
+        if re.search(rf"(?<![\w-]){re.escape(needle)}(?![\w-])", library):
+            return needle
+    want = slugify(m["title"])
+    for stem in notes.get(m["date"], []):
+        if difflib.SequenceMatcher(None, want, stem).ratio() >= 0.6:
+            return stem
+    return ""
+
+
+def _log_traces(d: str) -> str:
+    """Slugified text of the parts of a day's Log that record a meeting after it
+    happened: the evening run and copied card notes. Not the brief, which names
+    every meeting on the calendar before it happens."""
+    path = MEMORY / "daily" / f"{d}.md"
+    if not path.exists():
+        return ""
+    _, body = parse_frontmatter(path.read_text(encoding="utf-8"))
+    log = sections_of(body).get("log", "")
+    keep, on = [], False
+    for line in log.splitlines():
+        if line.startswith("### "):
+            head = line[4:].strip().lower()
+            on = head.startswith(("evening processing", "notes from"))
+        if on:
+            keep.append(line)
+    return slugify("\n".join(keep))
+
+
+def triage_meetings(fathom: list[dict], calendar: list[dict], db: sqlite3.Connection) -> list[dict]:
+    library = "\n".join(p.read_text(encoding="utf-8", errors="replace") for p in md_files())
+    notes: dict[str, list[str]] = {}
+    for p in (MEMORY / "meetings").glob("*.md"):
+        m = re.match(r"(\d{4}-\d{2}-\d{2})-(.*)", p.stem)
+        if m:
+            notes.setdefault(m.group(1), []).append(m.group(2))
+    terms = _topic_terms(db)
+    rows = []
+    for m in fathom:
+        who = " ".join([m["recorded_by"]] + m["invitees"]).lower()
+        yours = ME in who
+        title = m["title"].lower()
+        topics = sorted({slug for t, slug in terms if re.search(rf"(?<!\w){re.escape(t)}(?!\w)", title)})
+        filed = _filed(m, library, notes)
+        if filed:
+            action, why = "done", f"filed ({filed})"
+        elif SKIP_TITLE_RE.search(m["title"]) and not yours:
+            action, why = "skip", "impromptu, not theirs"
+        elif yours and STANDUP_RE.search(m["title"]):
+            action, why = "light", "their standup"
+        elif yours:
+            action, why = "full", "they were on it"
+        elif topics:
+            action, why = "full", "topic " + ", ".join(topics)
+        else:
+            action, why = "line", "team call"
+        rows.append({**m, "action": action, "why": why, "source": "fathom"})
+    # Calendar meetings that left no trace: no recording in the list given, no
+    # meeting note that day with a close title, and not named in that day's
+    # evening log or copied card notes. Standups repeat daily and are left out.
+    for e in calendar:
+        if STANDUP_RE.search(e["title"]):
+            continue
+        want = slugify(e["title"])
+        same_day = [m for m in fathom if m["date"] == e["date"]]
+        if any(difflib.SequenceMatcher(None, want, slugify(m["title"])).ratio() >= 0.6 for m in same_day):
+            continue
+        if any(want and difflib.SequenceMatcher(None, want, stem).ratio() >= 0.6 for stem in notes.get(e["date"], [])):
+            continue
+        if want and want in _log_traces(e["date"]):
+            continue
+        rows.append({
+            "title": e["title"], "date": e["date"], "id": "", "url": "", "recorded_by": "",
+            "invitees": e["attendees"], "action": "no-trace", "why": e["time"], "source": "calendar",
+        })
+    order = {"full": 0, "light": 1, "no-trace": 2, "line": 3, "skip": 4, "done": 5}
+    rows.sort(key=lambda r: (order[r["action"]], r["date"], r["title"]))
+    return rows
+
+
+def cmd_meetings(args) -> int:
+    if not args.fathom and not args.calendar:
+        print("pass a Fathom listing, --calendar, or both", file=sys.stderr)
+        return 1
+    fathom = []
+    if args.fathom:
+        fathom = parse_fathom(Path(args.fathom).read_text(encoding="utf-8") if args.fathom != "-" else sys.stdin.read())
+    calendar = parse_calendar(Path(args.calendar).read_text(encoding="utf-8")) if args.calendar else []
+    if not fathom and not calendar:
+        print("no meetings parsed. Fathom: the list_meetings output, text or JSON. Calendar: list_events JSON.", file=sys.stderr)
+        return 1
+    rows = triage_meetings(fathom, calendar, fresh_db())
+    if args.json:
+        print(json.dumps(rows, indent=2))
+        return 0
+    counts: dict[str, int] = {}
+    for r in rows:
+        counts[r["action"]] = counts.get(r["action"], 0) + 1
+        if r["action"] in ("done", "skip") and not args.all:
+            continue
+        ref = f"id {r['id']}  {r['url']}" if r["id"] else ", ".join(r["invitees"][:3])
+        print(f"  {r['action']:<10} {r['date']}  {r['title'][:60]}  \x1b[2m{r['why']} · {ref}\x1b[0m")
+    print("  " + "  ".join(f"{k} {counts.get(k, 0)}" for k in ("full", "light", "no-trace", "line", "skip", "done")))
+    return 0
+
+
+# --------------------------------------------------------------------------
+# improvements — the ledger the Friday review must not forget
+# --------------------------------------------------------------------------
+
+def _git(*a: str) -> str:
+    try:
+        return subprocess.run(["git", *a], cwd=ROOT, capture_output=True, text=True, check=False).stdout
+    except OSError:
+        return ""
+
+
+def cmd_improvements(args) -> int:
+    """Open items in memory/improvements.md, with how often they were seen and
+    whether a commit since the ask touched skills/ or bin/ with matching words.
+    Chases shape: `- [ ] **area** what · seen YYYY-MM-DD · seen YYYY-MM-DD`."""
+    path = MEMORY / "improvements.md"
+    if not path.exists():
+        print("no memory/improvements.md")
+        return 1
+    _, body = parse_frontmatter(path.read_text(encoding="utf-8"))
+    body = strip_scaffolding(body)
+    items = []
+    cur: list[str] | None = None
+    cur_open = True
+    for line in body.splitlines():
+        if line.startswith("- [ ]") or line.startswith("- [x]"):
+            if cur:
+                items.append((cur_open, " ".join(x.strip() for x in cur)))
+            cur = [line[5:]]
+            cur_open = line.startswith("- [ ]")
+        elif cur is not None and line.startswith((" ", "\t")) and line.strip():
+            cur.append(line)
+        else:
+            if cur:
+                items.append((cur_open, " ".join(x.strip() for x in cur)))
+            cur = None
+    if cur:
+        items.append((cur_open, " ".join(x.strip() for x in cur)))
+    stop = {"the", "and", "for", "with", "that", "this", "from", "into", "when", "then", "than", "only", "not"}
+    n = 0
+    for is_open, text in items:
+        if not is_open:
+            continue
+        n += 1
+        seen = re.findall(r"seen\s+(\d{4}-\d{2}-\d{2})", text)
+        first = min(seen) if seen else (DATE_RE.search(text).group(1) if DATE_RE.search(text) else "")
+        words = {w for w in re.findall(r"[a-z]{4,}", re.sub(r"\*\*", "", text).lower()) if w not in stop}
+        hint = ""
+        if first:
+            log = _git("log", f"--since={first}", "--format=%h %s", "--", "skills", "bin", "routines", "templates", "CLAUDE.md")
+            for line in log.splitlines():
+                lw = set(re.findall(r"[a-z]{4,}", line.lower()))
+                if len(words & lw) >= 2:
+                    hint = f"possibly fixed: {line[:70]}"
+                    break
+        lead = BOLD_LEAD.search(text)
+        label = re.sub(r"\*\*", "", text)[:80]
+        mark = "\x1b[31m" if len(seen) >= 2 else ""
+        print(f"  {mark}{len(seen):>2}x\x1b[0m  since {first or '?'}  {label}" + (f"\n        \x1b[33m{hint}\x1b[0m" if hint else ""))
+    print(f"{n} open improvement(s)")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# secrets — nothing that is a login belongs in git
+# --------------------------------------------------------------------------
+
+SECRET_PATTERNS = [
+    ("google api key", re.compile(r"AIza[0-9A-Za-z_-]{35}")),
+    ("google oauth token", re.compile(r"ya29\.[0-9A-Za-z_-]{20,}")),
+    ("google client secret", re.compile(r"GOCSPX-[0-9A-Za-z_-]{20,}")),
+    ("openai/anthropic key", re.compile(r"\bsk-(?:ant-)?[A-Za-z0-9_-]{24,}")),
+    ("slack token", re.compile(r"\bxox[abpr]-[0-9A-Za-z-]{10,}")),
+    ("private key", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
+    ("refresh token field", re.compile(r"[\"']?refresh_token[\"']?\s*[:=]\s*[\"']?[A-Za-z0-9_./-]{20,}")),
+    ("client secret field", re.compile(r"client_secret\s*[:=]\s*[\"']?[A-Za-z0-9_-]{12,}")),
+    ("password field", re.compile(r"\bpassword\s*[:=]\s*[\"']?\S{6,}", re.I)),
+    ("bearer token", re.compile(r"Bearer\s+[A-Za-z0-9_.-]{20,}")),
+    ("aws key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
+]
+SECRET_SKIP = ("node_modules/", ".brain/")
+
+
+def cmd_secrets(args) -> int:
+    files = _git("ls-files").splitlines()
+    if args.staged:
+        files = _git("diff", "--cached", "--name-only").splitlines()
+    hits = 0
+    for f in files:
+        if any(s in f for s in SECRET_SKIP):
+            continue
+        p = ROOT / f
+        if not p.is_file():
+            continue
+        try:
+            text = p.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for i, line in enumerate(text.splitlines(), 1):
+            for label, pat in SECRET_PATTERNS:
+                if pat.search(line):
+                    # bin/brain names these patterns; it is not a leak.
+                    if f == "bin/brain" and "re.compile" in line:
+                        continue
+                    hits += 1
+                    print(f"  {f}:{i}  {label}  {line.strip()[:60]}")
+    print(f"{hits} possible secret(s) in {len(files)} tracked file(s)")
+    return 1 if hits else 0
+
+
+# --------------------------------------------------------------------------
+# sample: pick the month's outputs for the owner to read, and read their notes back
+# --------------------------------------------------------------------------
+
+# Error analysis, from the evals-skills repo, sized for one reader. Code picks what to
+# read: every kind of output gets a turn, then random picks cover what the kinds miss.
+# He writes plain notes. The review-outputs skill sorts them. Added 2026-09-28.
+
+SAMPLE_LOG_KINDS = [  # heading prefix under ## Log -> kind. First match wins.
+    ("morning brief", "morning brief"), ("re-rank", "morning brief"),
+    ("evening", "evening run"), ("close the loop", "evening run"), ("top 3 review", "evening run"),
+    ("triage", "inbox triage"), ("prep", "meeting prep"),
+    ("weekly review", "weekly review"), ("weekly plan", "weekly plan"),
+]
+SAMPLE_MIN_LINES = 3
+SAMPLE_EXCERPT = 15
+SAMPLE_NOTE = "Note:"
+
+
+def _blocks(text: str) -> list[tuple[str, str]]:
+    """`### ` blocks in one `## ` section, as (heading, text)."""
+    out, head, buf = [], None, []
+    for line in text.splitlines():
+        if line.startswith("### "):
+            if head:
+                out.append((head, "\n".join(buf).strip()))
+            head, buf = line[4:].strip(), []
+        elif head:
+            buf.append(line)
+    if head:
+        out.append((head, "\n".join(buf).strip()))
+    return out
+
+
+def sample_units(days: int) -> list[dict]:
+    """Every output the routines wrote in the window, one unit each: a block of a
+    brief, a block of the day's log, a meeting note, a decision."""
+    units = []
+    for d, path in daily_notes(days):
+        rel = str(path.relative_to(MEMORY)).removesuffix(".md")
+        secs = _daily_sections(path)
+        for sec, kind_of in (("brief", lambda h: "brief"), ("log", None)):
+            for head, text in _blocks(secs.get(sec, "")):
+                if kind_of:
+                    kind = kind_of(head)
+                else:
+                    low = head.lower()
+                    kind = next((k for p, k in SAMPLE_LOG_KINDS if low.startswith(p)), "")
+                real = [l for l in text.splitlines() if l.strip() and not RAN.search(l)]
+                if kind and len(real) >= SAMPLE_MIN_LINES:
+                    units.append({"kind": kind, "link": rel, "part": head, "date": d.isoformat(), "text": text})
+    since = (today() - timedelta(days=days)).isoformat()
+    for sub, kind in (("meetings", "meeting note"), ("decisions", "decision")):
+        for path in sorted((MEMORY / sub).glob("*.md")):
+            meta, body = parse_frontmatter(path.read_text(encoding="utf-8"))
+            dt = note_date(path, meta)
+            if dt and dt >= since:
+                units.append({"kind": kind, "link": str(path.relative_to(MEMORY)).removesuffix(".md"),
+                              "part": "", "date": dt, "text": strip_scaffolding(body).strip()})
+    return units
+
+
+def pick_samples(units: list[dict], n: int, seed: str) -> list[dict]:
+    """About two thirds by kind, round robin, so every kind gets read. The rest at
+    random from everything left, so what the kinds miss can still turn up. The seed
+    is the month, so the same month gives the same picks."""
+    import random
+    rng = random.Random(seed)
+    pool = units[:]
+    rng.shuffle(pool)
+    by_kind: dict[str, list[dict]] = {}
+    for u in pool:
+        by_kind.setdefault(u["kind"], []).append(u)
+    picked: list[dict] = []
+    target = max(1, round(n * 2 / 3))
+    while len(picked) < target and any(by_kind.values()):
+        for k in sorted(by_kind):
+            if by_kind[k] and len(picked) < target:
+                picked.append(by_kind[k].pop())
+    rest = [u for u in pool if u not in picked]
+    for u in rest[: n - len(picked)]:
+        u["random"] = True
+        picked.append(u)
+    return sorted(picked, key=lambda u: (u["date"], u["kind"]))
+
+
+def sample_sheet(picks: list[dict], month: str, days: int) -> str:
+    out = [f"---\ntype: inbox\ntitle: Output review {month}\ndate: {today().isoformat()}\n---\n",
+           f"# Output review {month}\n",
+           f"{len(picks)} things the routines wrote in the last {days} days. Read each one.",
+           "",
+           f"If something is wrong, write it after {SAMPLE_NOTE} in plain words. A wrong fact,",
+           "the wrong person, the wrong priority, too long, something missed. Anything.",
+           "",
+           "Fine? Leave it empty. Stop whenever you like. Half done is still useful.",
+           ""]
+    for i, u in enumerate(picks, 1):
+        part = f", {u['part']}" if u["part"] else ""
+        tag = " (random)" if u.get("random") else ""
+        out.append(f"## {i}. {u['kind'].capitalize()}{part}{tag}")
+        out.append("")
+        out.append(f"[[{u['link']}]] · {u['date']}")
+        out.append(f"<!-- sample: {u['link']}#{u['part']} -->")
+        out.append("")
+        lines = [l for l in u["text"].splitlines() if not RAN.search(l)]
+        for l in lines[:SAMPLE_EXCERPT]:
+            out.append("> " + re.sub(r"^#+\s*", "", l) if l.strip() else ">")
+        if len(lines) > SAMPLE_EXCERPT:
+            out.append(f"> ... {len(lines) - SAMPLE_EXCERPT} more lines in the file")
+        out.append("")
+        out.append(SAMPLE_NOTE)
+        out.append("")
+    return "\n".join(out)
+
+
+def sheet_notes(path: Path) -> list[dict]:
+    """His notes from a review sheet: the sample each belongs to, and the note.
+    A note runs from `Note:` to the next heading. Empty ones are left out."""
+    out, cur = [], None
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.startswith("## "):
+            if cur and cur["note"].strip():
+                out.append(cur)
+            cur = {"title": line[3:].strip(), "sample": "", "note": "", "in_note": False}
+        elif cur is None:
+            continue
+        elif m := re.match(r"<!--\s*sample:\s*(.*?)\s*-->", line):
+            cur["sample"] = m.group(1)
+        elif line.startswith(SAMPLE_NOTE):
+            cur["in_note"] = True
+            cur["note"] += line[len(SAMPLE_NOTE):].strip() + "\n"
+        elif cur["in_note"]:
+            cur["note"] += line + "\n"
+    if cur and cur["note"].strip():
+        out.append(cur)
+    for c in out:
+        c["note"] = c["note"].strip()
+        del c["in_note"]
+    return out
+
+
+def cmd_sample(args) -> int:
+    if args.notes:
+        path = Path(args.notes)
+        path = path if path.is_absolute() else ROOT / path
+        notes = sheet_notes(path)
+        if args.json:
+            print(json.dumps(notes, indent=2))
+            return 0
+        for c in notes:
+            print(f"\x1b[1m{c['title']}\x1b[0m  \x1b[2m{c['sample']}\x1b[0m")
+            print(textwrap.indent(c["note"], "  "))
+        print(f"{len(notes)} note(s)")
+        return 0
+    month = args.month or today().strftime("%Y-%m")
+    units = sample_units(args.days)
+    if not units:
+        print(f"nothing written in the last {args.days} days")
+        return 1
+    picks = pick_samples(units, args.n, month)
+    kinds: dict[str, int] = {}
+    for u in units:
+        kinds[u["kind"]] = kinds.get(u["kind"], 0) + 1
+    if not args.write:
+        for u in picks:
+            part = f"  {u['part']}" if u["part"] else ""
+            print(f"  {u['date']}  {u['kind']:<14} {u['link']}{part}{'  (random)' if u.get('random') else ''}")
+        print(f"{len(picks)} picked from {len(units)}: " + ", ".join(f"{k} {v}" for k, v in sorted(kinds.items())))
+        return 0
+    out = MEMORY / "inbox" / f"review-{month}.md"
+    if out.exists():
+        print(f"{out.relative_to(ROOT)} already exists. Not overwritten.", file=sys.stderr)
+        return 1
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(sample_sheet(picks, month, args.days), encoding="utf-8")
+    print(out.relative_to(ROOT))
+    return 0
+
+
+# --------------------------------------------------------------------------
+# config — is brain.json filled in?
+# --------------------------------------------------------------------------
+
+# Every key a routine or skill reads. Value: what it is for, shown when it is missing.
+CONFIG_KEYS = {
+    "name": "your full name, as it appears in mail and calendar",
+    "email": "the work address the Gmail and Calendar connectors are signed in as",
+    "timezone": "an IANA name such as Europe/London or Asia/Kolkata",
+    "hespia_org": "your Hespia org id. Ask the connector: list_orgs",
+}
+PLACEHOLDER = re.compile(r"^(your|you@|<|todo|changeme)", re.I)
+
+
+def cmd_config(args) -> int:
+    """Print brain.json and say what is still missing. Exit 1 if anything is."""
+    if not CONFIG_PATH.exists():
+        print(f"no brain.json at {CONFIG_PATH}. Copy brain.example.json to brain.json and fill it in.")
+        return 1
+    missing = []
+    for key, why in CONFIG_KEYS.items():
+        val = str(CONFIG.get(key) or "").strip()
+        ok = bool(val) and not PLACEHOLDER.search(val)
+        if key == "timezone" and ok and LOCAL_TZ is timezone.utc and val.upper() != "UTC":
+            ok = False
+        mark = "ok " if ok else "\x1b[31m-- \x1b[0m"
+        print(f"  {mark} {key:<11} {val or '(empty)'}")
+        if not ok:
+            missing.append(f"{key}: {why}")
+    print(f"  {'':3} {'now':<11} {now().strftime('%Y-%m-%d %H:%M %Z')}")
+    if missing:
+        print(f"\n\x1b[1m{len(missing)} to fill in\x1b[0m")
+        for m in missing:
+            print(f"  {m}")
+        return 1
+    print("\nready")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# main
+# --------------------------------------------------------------------------
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="brain", description="the deterministic layer of a personal intelligence")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("index", help="rebuild the full-text index over memory/")
+    p.add_argument("-v", "--verbose", action="store_true")
+    p.set_defaults(func=lambda a: (print(f"indexed {build_index(a.verbose)} notes"), 0)[1])
+
+    p = sub.add_parser("search", help="full-text search the library")
+    p.add_argument("query", nargs="+")
+    p.add_argument("--type", help="person | company | project | meeting | decision | daily | inbox | topic")
+    p.add_argument("--since", help="YYYY-MM-DD, by note date or last update")
+    p.add_argument("--until", help="YYYY-MM-DD")
+    p.add_argument("--loose", action="store_true", help="match any of the words, not all")
+    p.add_argument("--recent", action="store_true", help="newest first instead of best match first")
+    p.add_argument("-n", "--limit", type=int, default=10)
+    p.set_defaults(func=cmd_search)
+
+    p = sub.add_parser("who", help="everything the library knows about a person")
+    p.add_argument("name", nargs="+")
+    p.add_argument("--since", help="YYYY-MM-DD, only mentions on or after")
+    p.add_argument("-n", "--limit", type=int, default=15)
+    p.set_defaults(func=cmd_who)
+
+    p = sub.add_parser("new", help="create a note from a template")
+    p.add_argument("kind", choices=list(TYPE_DIRS))
+    p.add_argument("title", nargs="*")
+    p.add_argument("--date")
+    p.add_argument("--set", action="append", metavar="KEY=VALUE")
+    p.add_argument("--force", action="store_true", help="create a person even if a similar file exists")
+    p.set_defaults(func=cmd_new)
+
+    p = sub.add_parser("today", help="path to today's daily note, creating it if needed")
+    p.set_defaults(func=cmd_today)
+
+    p = sub.add_parser("links", help="inbound and outbound links for a note")
+    p.add_argument("path")
+    p.set_defaults(func=cmd_links)
+
+    p = sub.add_parser("recent", help="most recent notes by date")
+    p.add_argument("--type")
+    p.add_argument("--days", type=int)
+    p.add_argument("-n", "--limit", type=int, default=20)
+    p.set_defaults(func=cmd_recent)
+
+    p = sub.add_parser("status", help="library size, freshness, unprocessed inbox")
+    p.set_defaults(func=cmd_status)
+
+    p = sub.add_parser("health", help="did the routines run: brief, evening, review, plan, word cap, dashes, per day")
+    p.add_argument("--days", type=int, default=7)
+    p.set_defaults(func=cmd_health)
+
+    p = sub.add_parser("chases", help="open chase-ledger items with their age, stale ones flagged")
+    p.add_argument("--who", help="only items naming this person")
+    p.add_argument("--mine", action="store_true", help="only what you owe others")
+    p.add_argument("--by", choices=["person"], help="group by owner")
+    p.add_argument("--lint", action="store_true", help="items with no date, no link, or no known owner")
+    p.set_defaults(func=cmd_chases)
+
+    p = sub.add_parser("close", help="strike brief items whose Gmail thread got a reply or whose Hespia task got ticked")
+    p.add_argument("--gmail", nargs="+", metavar="THREAD_ID")
+    p.add_argument("--hespia", nargs="+", metavar="TASK_ID")
+    p.add_argument("--date", help="YYYY-MM-DD to stamp, default today")
+    p.add_argument("--days", type=int, default=7, help="how far back to look in memory/daily")
+    p.add_argument("--dry-run", action="store_true", help="print what would be struck, change nothing")
+    p.set_defaults(func=cmd_close)
+
+    p = sub.add_parser("repeats", help="brief items that have appeared in consecutive briefs")
+    p.add_argument("--days", type=int, default=14)
+    p.add_argument("--min", type=int, default=2, help="show items with at least this many consecutive briefs")
+    p.set_defaults(func=cmd_repeats)
+
+    p = sub.add_parser("closed", help="struck brief items, and which have an open chase behind them")
+    p.add_argument("--days", type=int, default=7)
+    p.set_defaults(func=cmd_closed)
+
+    p = sub.add_parser("carried", help="open brief items from recent days, deduped, for Carried forward")
+    p.add_argument("--days", type=int, default=7)
+    p.set_defaults(func=cmd_carried)
+
+    p = sub.add_parser("top3", help="the day's Top 3 from each brief, the evening's verdict per task, and who sat undone")
+    p.add_argument("--days", type=int, default=7)
+    p.set_defaults(func=cmd_top3)
+
+    p = sub.add_parser("actions", help="action checkboxes from meeting notes")
+    p.add_argument("--open", action="store_true", help="unchecked only")
+    p.add_argument("--person", help="owner name or slug")
+    p.set_defaults(func=cmd_actions)
+
+    p = sub.add_parser("retire", help="park a note in _to_delete/ next to it, never delete")
+    p.add_argument("path")
+    p.set_defaults(func=cmd_retire)
+
+    p = sub.add_parser("lint", help="style (em dashes) and structure (dangling links, stale projects, thin files)")
+    p.add_argument("--style", action="store_true")
+    p.add_argument("--structure", action="store_true")
+    p.add_argument("--path", nargs="+", help="style-check only these files")
+    p.add_argument("--strict", action="store_true", help="exit 1 on any finding")
+    p.add_argument("--tasks", metavar="FILE",
+                   help="every Hespia task id, done or open (JSON or one per line): flag hespia: tags that are not tasks")
+    p.set_defaults(func=cmd_lint)
+
+    p = sub.add_parser("sample", help="pick the month's outputs for a read-through, or read the notes back from the sheet")
+    p.add_argument("-n", type=int, default=15, help="how many to pick (default 15)")
+    p.add_argument("--days", type=int, default=30)
+    p.add_argument("--month", help="YYYY-MM. The seed and the sheet's name. Default this month")
+    p.add_argument("--write", action="store_true", help="write memory/inbox/review-YYYY-MM.md. Never overwrites")
+    p.add_argument("--notes", metavar="SHEET", help="print the notes the owner wrote in a review sheet")
+    p.add_argument("--json", action="store_true", help="with --notes, as JSON")
+    p.set_defaults(func=cmd_sample)
+
+    p = sub.add_parser("priorities", help="days since each stated priority in profile.md was touched")
+    p.set_defaults(func=cmd_priorities)
+
+    p = sub.add_parser("decisions", help="decisions, and which are due a revisit or an outcome")
+    p.add_argument("--due", action="store_true", help="only the ones due a look")
+    p.set_defaults(func=cmd_decisions)
+
+    p = sub.add_parser("topics", help="compiled topic pages, and which sources moved since the last compile")
+    p.add_argument("topic", nargs="?", help="one topic by slug or part of it, with the changed notes listed")
+    p.add_argument("--stale", action="store_true", help="only topics with changed sources or new mentions")
+    p.add_argument("--gaps", action="store_true", help="open lines under ## Gaps on every topic page")
+    p.set_defaults(func=cmd_topics)
+
+    p = sub.add_parser("meetings", help="which Fathom recordings still need to become memory, and which calendar meetings left no trace")
+    p.add_argument("fathom", nargs="?", help="file with the Fathom list_meetings output (text or JSON), or - for stdin")
+    p.add_argument("--calendar", help="file with Calendar list_events JSON: meetings that left no trace in the library")
+    p.add_argument("--all", action="store_true", help="also print the done and skipped rows")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_meetings)
+
+    p = sub.add_parser("improvements", help="open items in memory/improvements.md, seen counts, possible fixes in git")
+    p.set_defaults(func=cmd_improvements)
+
+    p = sub.add_parser("config", help="check brain.json: who this library belongs to, their timezone, their Hespia org")
+    p.set_defaults(func=cmd_config)
+
+    p = sub.add_parser("secrets", help="scan tracked files for anything that looks like a credential")
+    p.add_argument("--staged", action="store_true", help="only files staged for commit")
+    p.set_defaults(func=cmd_secrets)
+
+    args = ap.parse_args()
+    if not sys.stdout.isatty() or os.environ.get("NO_COLOR"):
+        _strip_color()
+    return args.func(args) or 0
+
+
+def _strip_color():
+    real_print = print
+
+    def plain(*a, **kw):
+        a = tuple(re.sub(r"\x1b\[[0-9;]*m", "", x) if isinstance(x, str) else x for x in a)
+        real_print(*a, **kw)
+
+    globals()["print"] = plain
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except BrokenPipeError:
+        # Piping into `head` closes the pipe early. Exit quietly rather than
+        # dumping a traceback, and redirect stdout so Python's shutdown flush
+        # doesn't raise a second time on the way out.
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        sys.exit(0)
+    except KeyboardInterrupt:
+        sys.exit(130)

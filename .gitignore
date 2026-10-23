@@ -1,0 +1,16 @@
+# Generated index and local state. Rebuildable from memory/ at any time.
+.brain/
+
+# Raw connector dumps staged before they become memory
+memory/inbox/raw/
+
+__pycache__/
+*.pyc
+.DS_Store
+.env
+
+# Scratch worktrees the desktop app creates. The owner removes them, nobody else.
+.claude/worktrees/
+
+# Parked files at the repo root. The owner deletes them.
+_to_delete/
