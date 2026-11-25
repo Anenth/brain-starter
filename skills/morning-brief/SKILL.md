@@ -123,8 +123,12 @@ Owner facts come from `brain.json` at the repo root (`name`, `email`, `timezone`
      task means the easier one gets ticked and the harder one vanishes.
    - **Never propose a task that completes when someone else sends something.** "Get
      Grace's corrected number" is a chase, not a task. Chases live in the ledger.
-   - In the brief, mark each proposed item `<!-- proposed -->` at the end of the line.
-     The evening run swaps that for the real `<!-- hespia:ID -->` once the owner accepts.
+   - In the brief, mark each proposed item `<!-- proposed:slug -->` at the end of the
+     line. The slug is two to four plain words, like `q3-data-pack`. An item that was
+     proposed before keeps **the same slug**, however the line is reworded. Look it up
+     with `bin/brain proposals --days 14`. The evening run turns it into
+     `<!-- hespia:ID --> <!-- accepted:slug -->` once the owner accepts. A bare
+     `<!-- proposed -->` still reads, but cannot be counted across days.
    - **Propose once. Never twice.** The same card, day after day, is noise. Before
      sending, `list_messages` and read the brain's morning messages from the last 14
      days. A proposed task there that was added (`addedTaskId`), skipped
@@ -163,6 +167,10 @@ Owner facts come from `brain.json` at the repo root (`name`, `email`, `timezone`
      A or B becomes the item's line in tomorrow's brief, "Drop it" strikes it. No
      reply after three days: the card stays, the item climbs to Friday as before.
      Do not propose it again and do not send a second card.
+   - **Once its Decide card is out, the item stops leading.** It leaves the Top 3,
+     Needs you and Decide today. It gets one line under `### Waiting on your tap`, at
+     the bottom of the brief: the item, the default, and the brief count. Same tags.
+     It comes back up only if a date on it is within two days.
    - Fourteen briefs: it leaves the daily brief and goes to Friday's "Decide or drop".
    - Dated items (`Due soon` in `bin/brain chases`) stay until the date passes, in
      `### Due`, not in Chasing.

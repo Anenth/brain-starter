@@ -63,7 +63,7 @@ Then, in a Claude Code session in this repo:
 | `bin/brain` | search, indexing, templates, the link graph. Python 3, no dependencies |
 | `templates/` | the shape of each note type |
 | `routines/` | what runs unattended, and how to wire it |
-| `tests/` | `python3 tests/test_close.py` and friends |
+| `tests/` | fixtures for the CLI. `python3 -m unittest discover -s tests` |
 
 ## The one thing that makes it compound
 

@@ -93,6 +93,14 @@ class LintTests(unittest.TestCase):
                   "Cards carry `<!-- hespia-msg:X1 -->` and tasks `<!-- hespia:X1 -->`.", day="2026-09-27")
         self.assertNotIn("id in both tags", self.known())
 
+    # found in review 2026-11-22 ------------------------------------------------
+
+    def test_path_that_is_not_there_does_not_read_as_clean(self):
+        r = run(self.tmp, "lint", "--path", "memory/daily/2026-13-99.md")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("no such file", r.stderr)
+        self.assertNotIn("0 finding(s)", r.stdout)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

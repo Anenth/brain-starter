@@ -126,7 +126,7 @@ Jan 7. P1 Grow Acme account: 8d untouched, gets Monday.
 - **Comparison page.** Third week on the list, nothing waits on it. Drop or park.
 
 **Missing from your list** (proposed, accept in Hespia)
-- Vendor contract renewal: name an owner. <!-- proposed -->
+- Vendor contract renewal: name an owner. <!-- proposed:vendor-renewal-owner -->
 
 <!-- hespia-msg:MESSAGEID -->
 ```

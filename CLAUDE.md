@@ -58,7 +58,8 @@ skills/          executable procedures. Markdown. If a smart intern could follow
 templates/       the shape of each note type
 bin/brain        the deterministic layer (search, index, new, status, links, health, chases, close, ...)
 routines/        what runs on a schedule, and how it's wired
-tests/           fixtures for bin/brain. python3 tests/test_close.py
+tests/           fixtures for every bin/ script. All of them: python3 -m unittest discover -s tests
+                 One file: python3 tests/test_close.py
   cases/         real mistakes, replayed against the current rules. python3 tests/run_cases.py
 .brain/          generated index and local state. Gitignored. Rebuild anytime with bin/brain index.
 ```
@@ -81,7 +82,7 @@ bin/brain links memory/people/ada-lovelace.md   # what points here, what this po
 bin/brain recent --type daily -n 2   # most recent notes by date
 bin/brain status                     # library size, staleness, inbox, parked files, profile TODOs
 bin/brain health                     # did the routines run: brief, evening, review, plan, dashes, per day
-bin/brain lint                       # style (em dashes) and structure (dangling links, stale projects)
+bin/brain lint                       # style (em dashes) and structure (dangling links, stale projects, blank relationship and role)
 bin/brain lint --path memory/daily/2026-09-21.md   # style-check one file
 bin/brain lint --tasks .brain/tasks.txt   # also flag hespia: tags that are not task ids
 bin/brain chases                     # due soon, owed to you, you owe them, aged and flagged
@@ -89,6 +90,7 @@ bin/brain chases --mine | --who ada | --by person | --lint
 bin/brain repeats --min 3            # brief items that led three or more briefs in a row
 bin/brain priorities                 # days since each stated priority was touched
 bin/brain carried --days 7           # open brief items, deduped, tags intact
+bin/brain proposals --days 7         # tasks the briefs proposed, counted once each, and how many the owner accepted
 bin/brain closed --days 7            # struck items, and which still have an open chase
 bin/brain top3 --days 7              # each day's Top 3 with the evening's verdict, stuck tasks, gaps
 bin/brain actions --open --person ada   # unchecked actions in meeting notes
@@ -100,11 +102,12 @@ bin/brain topics --stale             # only the ones that need a refresh
 bin/brain topics --gaps              # what the library should know but doesn't, from every topic
 bin/brain meetings .brain/fathom.txt # which recordings still need a note, a line, or nothing
 bin/brain meetings --calendar .brain/calendar.json   # meetings that left no trace at all
+bin/brain sessions --days 14         # Claude Code threads that went quiet, dropped first. Local only.
 bin/brain close --gmail <ids>        # strike brief items whose Gmail thread got a reply
 bin/brain close --hespia <ids>       # strike brief items whose Hespia task has done: true
 bin/brain close ... --dry-run        # show what would be struck
 bin/brain retire memory/inbox/x.md   # park a file in _to_delete/. The only way a file leaves.
-bin/brain secrets                    # scan tracked files for anything that looks like a credential
+bin/brain secrets                    # scan tracked and new files for anything that looks like a credential
 bin/brain today                      # path to today's daily note (creates it)
 bin/brain sample                     # the month's 15 outputs to read. --write makes the sheet, --notes reads the owner's notes
 ```
@@ -128,7 +131,8 @@ unless something looks wrong.
    a dated line, so the reasoning trail survives. A file that must go is parked with
    `bin/brain retire`, never `rm`, never `git rm`. The owner removes parked files.
 7. **Tags are ids, and ids have kinds.** `<!-- gmail:threadId -->`, `<!-- hespia:taskId -->`,
-   `<!-- hespia-msg:messageId -->`, `<!-- proposed -->`. Never put a message id in a
+   `<!-- hespia-msg:messageId -->`, `<!-- proposed:slug -->` (bare `<!-- proposed -->`
+   still reads), `<!-- accepted:slug -->`. Never put a message id in a
    `hespia:` tag. `close` strikes on gmail and hespia only, and only for ids you pass it.
    An id that is missing from a list is not "done". Only `done: true` is.
 

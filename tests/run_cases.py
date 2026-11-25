@@ -136,6 +136,7 @@ def main() -> int:
         print("the claude command is not installed")
         return 1
     failed = 0
+    errored = 0  # the claude call itself broke. Not a verdict on the rule.
     for path in files:
         case = parse_case(path)
         prompt = run_prompt(case, args.rev)
@@ -147,20 +148,30 @@ def main() -> int:
             output = claude(prompt, args.model)
         except Exception as e:
             print(f"  ERROR  {e}")
-            failed += 1
+            errored += 1
             continue
         print("  output  " + output.replace("\n", "\n          "))
         fails = check(case, output)
         for f in fails:
             print(f"  FAIL   code: {f}")
-        verdict, critique = judge(case, output) if case["judge"] else ("Pass", "")
+        try:
+            verdict, critique = judge(case, output) if case["judge"] else ("Pass", "")
+        except Exception as e:
+            print(f"  ERROR  judge: {e}")
+            errored += 1
+            continue
         print(f"  {verdict.upper():<6} judge: {critique}")
         ok = not fails and verdict == "Pass"
         failed += not ok
         print(f"  {'PASS' if ok else 'FAIL'}")
     if not args.show:
-        print(f"\n{len(files) - failed} of {len(files)} case(s) pass")
-    return 1 if failed else 0
+        ran = len(files) - errored
+        print(f"\n{ran - failed} of {ran} case(s) pass")
+        if errored:
+            print(f"{errored} case(s) could not run. That is the claude command, not the rule. "
+                  "Check it is logged in, then run again.")
+    # 1: a rule failed. 2: nothing failed, but some cases never ran.
+    return 1 if failed else 2 if errored else 0
 
 
 if __name__ == "__main__":

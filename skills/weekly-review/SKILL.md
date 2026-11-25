@@ -126,9 +126,13 @@ one that never started.
     week's work or leaves the list. Every gap is also a line for the improvements
     ledger.
 17. **Proposals.** How many tasks did the briefs propose this week, and how many did
-    the owner accept? Count from the daily notes: `<!-- proposed -->` tags still
-    standing vs `<!-- hespia:ID -->` tags that replaced one. One line. If under a third
-    were accepted, say which kinds the owner ignores.
+    the owner accept? Run `bin/brain proposals --days 7`. It counts each proposal
+    once, however many days it was repeated. Never count the tags by hand. One line.
+    If under a third were accepted, say which kinds the owner ignores.
+17a. **Output review.** Any `memory/inbox/review-*.md` with notes: sort them with
+    `skills/review-outputs/SKILL.md` part 2. First Friday of the month and no open
+    sheet: make one with part 1. One line in the review either way: sheet made,
+    notes sorted and the types, or "sheet open, no notes yet".
 18. **Record the why.** Anything this review changed in how the system works (a rule, a
     threshold, a skill) gets a decision file with `bin/brain new decision`, reasoning
     included. The next review should be able to tell why it is the way it is.

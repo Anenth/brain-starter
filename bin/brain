@@ -88,7 +88,7 @@ WIKILINK = re.compile(r"\[\[([^\]|#]+)(?:[#|][^\]]*)?\]\]")
 # Template prompts get stripped; id tags (gmail/hespia/proposed/ran) are content,
 # not scaffolding, and must survive so MARK/RAN can still find them downstream.
 HTML_COMMENT = re.compile(
-    r"<!--(?!\s*(?:gmail:|hespia-msg:|hespia:|proposed\b|ran:)).*?-->", re.DOTALL
+    r"<!--(?!\s*(?:gmail:|hespia-msg:|hespia:|proposed\b|accepted:|ran:)).*?-->", re.DOTALL
 )
 DATE_RE = re.compile(r"(\d{4}-\d{2}-\d{2})")
 EM_DASH = "—"
@@ -281,13 +281,14 @@ def split_daily(body: str) -> tuple[str, str]:
     return "\n".join(keep), "\n".join(carried)
 
 
-def connect() -> sqlite3.Connection:
+def connect(path: Path = DB_PATH) -> sqlite3.Connection:
     INDEX_DIR.mkdir(exist_ok=True)
-    return sqlite3.connect(DB_PATH)
+    return sqlite3.connect(path)
 
 
 def build_index(verbose: bool = False) -> int:
-    db = connect()
+    tmp = DB_PATH.with_name(f"index.{os.getpid()}.tmp")
+    db = connect(tmp)
     db.executescript(
         """
         DROP TABLE IF EXISTS vocab;
@@ -346,6 +347,8 @@ def build_index(verbose: bool = False) -> int:
     db.execute("INSERT INTO meta VALUES ('fingerprint', ?)", (fingerprint(),))
     db.execute("INSERT INTO meta VALUES ('indexed_at', ?)", (now().isoformat(timespec="seconds"),))
     db.commit()
+    db.close()
+    os.replace(tmp, DB_PATH)
     return n
 
 
@@ -491,9 +494,13 @@ def cmd_who(args) -> int:
     name = " ".join(args.name)
     db = fresh_db()
     slug = slugify(name)
+    if not slug:
+        print("who needs a name", file=sys.stderr)
+        return 1
+    # Match the file name, not the whole path: "mo" sits in "memory/", "md" in ".md".
     people = db.execute(
         "SELECT path, title FROM fts WHERE type='person' AND (path LIKE ? OR lower(title) LIKE ?)",
-        (f"%{slug}%", f"%{name.lower()}%"),
+        (f"%/{'%' if len(slug) > 1 else ''}{slug}%.md", f"%{name.lower()}%"),
     ).fetchall()
 
     if not people:
@@ -524,10 +531,11 @@ def cmd_who(args) -> int:
             "LEFT JOIN fts f ON f.path = l.src WHERE l.dst = ?", (path,)
         ).fetchall():
             rows[src] = (dt or "", typ or "?", ttl or src, True)
-    for src, typ, dt, ttl in db.execute(
+    q = fts_query(name)  # empty when the name is all punctuation. FTS5 rejects an empty match.
+    for src, typ, dt, ttl in (db.execute(
         "SELECT path, type, date, title FROM fts WHERE fts MATCH ? LIMIT 200",
-        (fts_query(name),),
-    ).fetchall():
+        (q,),
+    ).fetchall() if q else []):
         if src not in seen and src not in rows:
             rows[src] = (dt or "", typ or "?", ttl or src, False)
     if args.since:
@@ -593,7 +601,8 @@ def render_template(kind: str, fields: dict) -> str:
         for key, val in fields.items():
             if key in ("slug", "datetime", "type"):
                 continue
-            head = re.sub(rf"(?m)^{re.escape(key)}:.*$", f"{key}: {val}", head)
+            line = f"{key}: {val}".replace("\n", " ")
+            head = re.sub(rf"(?m)^{re.escape(key)}:.*$", lambda _m: line, head)
         text = head + tail
     return text
 
@@ -617,6 +626,13 @@ def cmd_new(args) -> int:
         return 1
     title = " ".join(args.title) if args.title else today().isoformat()
     when = args.date or today().isoformat()
+    try:
+        ok = bool(re.fullmatch(r"\d{4}-\d{2}-\d{2}", when)) and date.fromisoformat(when)
+    except ValueError:
+        ok = False
+    if not ok:
+        print(f"--date must be YYYY-MM-DD, got '{when}'", file=sys.stderr)
+        return 1
     slug = slugify(title)
     filename = f"{when}-{slug}.md" if kind in DATED else f"{slug}.md"
     if kind == "daily":
@@ -798,7 +814,13 @@ def daily_notes(days: int) -> list[tuple[date, Path]]:
 
 MARK = re.compile(r"<!--\s*(gmail|hespia|hespia-msg|proposed):([A-Za-z0-9_-]+)\s*-->")
 PROPOSED_BARE = re.compile(r"<!--\s*proposed\s*-->")
+# A proposal with a slug keeps one identity across days: `<!-- proposed:mbr-pack -->`.
+# On accept the evening run turns it into `<!-- accepted:mbr-pack -->` beside the
+# hespia task id. Bare `<!-- proposed -->` still works, matched by gmail id or lead.
+PROPOSED_SLUG = re.compile(r"<!--\s*proposed:([A-Za-z0-9_-]+)\s*-->")
+ACCEPTED_SLUG = re.compile(r"<!--\s*accepted:([A-Za-z0-9_-]+)\s*-->")
 RAN = re.compile(r"<!--\s*ran:\s*(brief|evening|review|plan)\s+(\S+)\s+(ok|failed|backfilled)(?:\s+([^>]*?))?\s*-->")
+LOG_ENTRY_DATE = re.compile(r"^\s*(?:[-*]\s+|#+\s+)\**(\d{4}-\d{2}-\d{2})", re.MULTILINE)
 BULLET = re.compile(r"^(\s*)(- \[[ x]\] |- |\* |\d+\. )(.*)$")
 BOLD_LEAD = re.compile(r"\*\*(.+?)\*\*")
 
@@ -843,10 +865,11 @@ def count_dashes(text: str) -> int:
 
 
 def prose_word_count(text: str) -> int:
-    """Words against the cap. Id tags (gmail/hespia/proposed) are metadata he
+    """Words against the cap. Id tags (gmail/hespia/proposed) are metadata the owner
     never reads, not prose, and must not count against the 700-word budget."""
     stripped = MARK.sub("", text)
     stripped = PROPOSED_BARE.sub("", stripped)
+    stripped = ACCEPTED_SLUG.sub("", stripped)
     return len(stripped.split())
 
 
@@ -1000,10 +1023,11 @@ def cmd_close(args) -> int:
         changed = False
         for i, line in enumerate(lines):
             # a line can carry both a gmail and a hespia tag; check every one
-            mm = next((m for m in MARK.finditer(line) if (m.group(1), m.group(2)) in ids), None)
-            if not mm:
+            hits = [m for m in MARK.finditer(line) if (m.group(1), m.group(2)) in ids]
+            if not hits:
                 continue
-            matched.add((mm.group(1), mm.group(2)))
+            matched.update((m.group(1), m.group(2)) for m in hits)
+            mm = hits[0]
             if "~~" in line:
                 continue
             verb = CLOSE_VERB[mm.group(1)]
@@ -1084,8 +1108,10 @@ def parse_chases() -> list[dict]:
     path = MEMORY / "chases.md"
     if not path.exists():
         return []
-    _, body = parse_frontmatter(path.read_text(encoding="utf-8"))
-    body = strip_scaffolding(body)
+    raw = path.read_text(encoding="utf-8")
+    _, body = parse_frontmatter(raw)
+    offset = raw[: len(raw) - len(body)].count("\n")
+    body = HTML_COMMENT.sub(lambda m: "\n" * m.group(0).count("\n"), body)
     items: list[dict] = []
     section = ""
     cur: list[str] | None = None
@@ -1128,7 +1154,7 @@ def parse_chases() -> list[dict]:
             flush()
             cur = [line[5:]]
             cur_open = line.startswith("- [ ]")
-            cur_line = n
+            cur_line = n + offset
         elif cur is not None and line.startswith((" ", "\t")) and line.strip():
             cur.append(line)
         else:
@@ -1253,8 +1279,12 @@ def cmd_repeats(args) -> int:
     streak: dict[str, dict] = {}
     prev_day: date | None = None
     for d, items in briefs:
+        seen_today: set[str] = set()
         for b in items:
             k = item_key(b)
+            if k in seen_today:
+                continue
+            seen_today.add(k)
             if k in streak and streak[k]["last"] == prev_day:
                 streak[k]["n"] += 1
             else:
@@ -1316,9 +1346,13 @@ def cmd_carried(args) -> int:
     days, deduped by tag then bold lead, tags kept. First-seen date gives the age."""
     first: dict[str, tuple[date, str]] = {}
     latest: dict[str, str] = {}
+    days: list[tuple[date, list[str]]] = []
     for d, p in daily_notes(args.days):
         secs = _daily_sections(p)
-        text = secs.get("brief", "") + "\n" + secs.get("carried forward", "")
+        # sections_of drops heading lines, so put the heading back between the two.
+        # Without it the Carried forward bullets hang off the brief's last ### block
+        # and vanish when that block is not a kept one (a brief that ends on FYI).
+        text = secs.get("brief", "") + "\n## Carried forward\n" + secs.get("carried forward", "")
         # only the brief's needs-you, chasing and carried blocks, not meeting cards
         keep = []
         take = False
@@ -1332,10 +1366,42 @@ def cmd_carried(args) -> int:
                 continue
             if take:
                 keep.append(line)
-        for b in bullets_in("\n".join(keep)):
-            if "~~" in b:
-                continue
+        days.append((d, [b for b in bullets_in("\n".join(keep)) if "~~" not in b]))
+    # Untagged bullets are keyed by their bold lead, and a lead can be shared: three
+    # "**Fri 20 Nov.**" lines under Due, or a You owe and a Chasing line for one
+    # person. Keyed by lead alone, all but one were dropped. Where one day holds two
+    # different bullets under one key, follow each as its own thread, matched by
+    # wording, so "23 things, oldest 108 days" and tomorrow's "24 things, oldest 109
+    # days" stay one row and "Send the deck" and "Pay the vendor" stay two.
+    crowded: set[str] = set()
+    for _, bs in days:
+        texts: dict[str, set[str]] = {}
+        for b in bs:
+            if not MARK.search(b):
+                texts.setdefault(item_key(b), set()).add(b)
+        crowded |= {k for k, t in texts.items() if len(t) > 1}
+
+    def rest(b: str) -> str:
+        """The bullet without its tags and bold lead: the part that tells two apart."""
+        t = re.sub(r"\*\*.*?\*\*", "", HTML_COMMENT.sub("", b), count=1).strip().lower()
+        return t or b.lower()
+
+    threads: dict[str, list[dict]] = {}
+    for d, bs in days:
+        for b in bs:
             k = item_key(b)
+            if k in crowded and not MARK.search(b):
+                r = rest(b)
+                best, score = None, 0.75
+                for t in threads.setdefault(k, []):
+                    ratio = 1.0 if t["text"] == r else difflib.SequenceMatcher(None, r, t["text"]).ratio()
+                    if ratio >= score:
+                        best, score = t, ratio
+                if best is None:
+                    best = {"key": f"{k}#{len(threads[k]) + 1}"}
+                    threads[k].append(best)
+                best["text"] = r
+                k = best["key"]
             first.setdefault(k, (d, b))
             latest[k] = b
     rows = sorted(first.items(), key=lambda kv: kv[1][0])
@@ -1347,12 +1413,101 @@ def cmd_carried(args) -> int:
 
 
 # --------------------------------------------------------------------------
+# proposals: what the briefs proposed, and what the owner took
+# --------------------------------------------------------------------------
+
+HESPIA_TASK = re.compile(r"<!--\s*hespia:([A-Za-z0-9_-]+)\s*-->")
+HESPIA_CARD = re.compile(r"<!--\s*hespia-msg:([A-Za-z0-9_-]+)\s*-->")
+GMAIL_TAG = re.compile(r"<!--\s*gmail:([A-Za-z0-9_-]+)\s*-->")
+
+
+def proposal_key(text: str) -> str:
+    """One key for the same proposal across days. The `proposed` tag turns into a
+    hespia tag when the owner accepts, so neither can be the key. The slug first, when the
+    brief gave one. Then the gmail id, the bold lead, the first six words."""
+    sl = PROPOSED_SLUG.search(text) or ACCEPTED_SLUG.search(text)
+    if sl:
+        return "slug:" + sl.group(1).lower()
+    g = GMAIL_TAG.search(text)
+    if g:
+        return "gmail:" + g.group(1)
+    b = BOLD_LEAD.search(text)
+    if b:
+        return "lead:" + slugify(b.group(1))[:60]
+    words = re.findall(r"\w+", re.sub(r"<!--.*?-->", "", text).lower())
+    return "text:" + "-".join(words[:6])
+
+
+def cmd_proposals(args) -> int:
+    """Tasks the briefs proposed in the last N days, counted once each however many
+    days they were repeated. Accepted means the same item later carries a
+    `hespia:` task id. Carded means a Hespia card went out and no task exists yet."""
+    props: dict[str, dict] = {}
+    notes = daily_notes(args.days)
+    for d, p in notes:
+        _, body = parse_frontmatter(p.read_text(encoding="utf-8"))
+        for b in bullets_in(body):
+            k = proposal_key(b)
+            bare = bool(PROPOSED_BARE.search(b) or PROPOSED_SLUG.search(b))
+            if bare and k not in props:
+                props[k] = {"first": d, "days": set(), "text": b, "task": False, "card": False, "struck": False}
+            if k not in props:
+                continue          # never proposed in this window, so not a proposal
+            r = props[k]
+            if bare:
+                r["days"].add(d)
+            if ACCEPTED_SLUG.search(b) or (HESPIA_TASK.search(b) and not bare):
+                r["task"] = True
+            if HESPIA_CARD.search(b):
+                r["card"] = True
+            r["struck"] = "~~" in b   # the latest day wins
+            r["text"] = b
+    if not props:
+        print(f"no proposals in the last {args.days} day(s)")
+        return 0
+
+    def state(r: dict) -> str:
+        if r["task"]:
+            return "accepted"
+        if r["struck"]:
+            return "struck"
+        if r["card"]:
+            return "carded"
+        return "undecided"
+
+    order = ["accepted", "carded", "undecided", "struck"]
+    counts = {k: 0 for k in order}
+    for r in props.values():
+        counts[state(r)] += 1
+    total = len(props)
+    raw = sum(len(r["days"]) for r in props.values())
+    pct = round(100 * counts["accepted"] / total)
+    print(f"proposals  last {args.days} day(s)  ·  {total} distinct  ·  {raw} tag(s) before dedup")
+    print(f"  accepted {counts['accepted']} ({pct}%)  ·  carded {counts['carded']}  ·  "
+          f"undecided {counts['undecided']}  ·  struck {counts['struck']}")
+    for want in ("undecided", "carded"):
+        rows = sorted((r for r in props.values() if state(r) == want), key=lambda r: (-len(r["days"]), r["first"]))
+        if not rows:
+            continue
+        print(f"\n{want}")
+        for r in rows:
+            label = re.sub(r"\s+", " ", re.sub(r"<!--.*?-->|\*\*", "", r["text"])).strip()
+            label = re.sub(r"^(- \[[ x]\] |- |\* |\d+\. )", "", label)
+            print(f"  {len(r['days'])}x  since {r['first']}  {label[:90]}")
+    loose = sum(1 for k in props if not k.startswith("slug:"))
+    if loose:
+        print(f"\n{loose} of {total} have no slug. They are matched by gmail id or bold lead, "
+              "so a reworded item counts twice.", file=sys.stderr)
+    return 0
+
+
+# --------------------------------------------------------------------------
 # top3 — the day's three, and how the week went
 # --------------------------------------------------------------------------
 
 TOP3_SINCE = date(2026, 9, 24)   # the Top 3 rule starts here; earlier briefs are not gaps
 PLAN_SINCE = date(2026, 9, 27)   # first Saturday plan
-TOP3_VERDICT = re.compile(r"^\s*(?:-|\d+\.)\s*(done|open|not found)\b", re.IGNORECASE)
+TOP3_VERDICT = re.compile(r"^\s*(?:-|\d+\.)\s*(?:~~\s*)?(done|open|not found)\b", re.IGNORECASE)
 
 
 def _block_after(text: str, heading: str) -> str:
@@ -1391,20 +1546,20 @@ def cmd_top3(args) -> int:
             continue
         picks = []
         for b in bullets_in(_block_after(brief, "top 3")):
-            m = MARK.search(b)
-            if not m or m.group(1) != "hespia":
+            m = HESPIA_TASK.search(b)
+            if not m:
                 continue
             lead = BOLD_LEAD.search(b)
             text = lead.group(1) if lead else re.sub(r"<!--.*?-->|\*\*", "", b).strip()[:60]
             text = text.rstrip(" .:,")
-            picks.append((m.group(2), text))
+            picks.append((m.group(1), text))
         verdicts: dict[str, str] = {}
         review = _block_after(log, "top 3 review")
         for b in bullets_in(review):
-            m = MARK.search(b)
+            m = HESPIA_TASK.search(b)
             v = TOP3_VERDICT.match(b)
-            if m and m.group(1) == "hespia" and v:
-                verdicts[m.group(2)] = v.group(1).lower()
+            if m and v:
+                verdicts[m.group(1)] = v.group(1).lower()
         days.append({"date": d, "picks": picks, "verdicts": verdicts, "reviewed": bool(review.strip())})
         for tid, text in picks:
             t = per_task.setdefault(tid, {"text": text, "days": [], "done": None, "last": None})
@@ -1499,6 +1654,9 @@ def cmd_retire(args) -> int:
     if not p.exists():
         print(f"no such file: {args.path}", file=sys.stderr)
         return 1
+    if not p.is_file():
+        print(f"retire parks one file, not a folder: {args.path}", file=sys.stderr)
+        return 1
     park = p.parent / "_to_delete"
     park.mkdir(exist_ok=True)
     dest = park / p.name
@@ -1547,7 +1705,10 @@ def lint_structure(db: sqlite3.Connection) -> int:
         fm, body = parse_frontmatter((ROOT / path).read_text(encoding="utf-8"))
         if fm.get("status") != "active":
             continue
-        log_dates = DATE_RE.findall(sections_of(body).get("log", ""))
+        log_text = sections_of(body).get("log", "")
+        # Only the date that opens a log entry counts. A deadline named in the prose
+        # of an older entry used to read as a newer log line (2026-10-30).
+        log_dates = LOG_ENTRY_DATE.findall(log_text) or DATE_RE.findall(log_text)
         last = max((d for d in log_dates if d <= td), default=dt)
         if last and age_days(last) > STALE_PROJECT_DAYS:
             n += 1
@@ -1578,6 +1739,22 @@ def lint_structure(db: sqlite3.Connection) -> int:
                 print(f"  duplicate line    {path}  {key[:70]}")
                 break
             seen.add(key)
+    # Blank template slots. One line per kind, so 30 empty files do not bury the rest.
+    blank_rel = []
+    for (path,) in db.execute("SELECT path FROM fts WHERE type='company' ORDER BY path").fetchall():
+        _, body = parse_frontmatter((ROOT / path).read_text(encoding="utf-8"))
+        if not sections_of(strip_scaffolding(body)).get("relationship", "").strip():
+            blank_rel.append(Path(path).stem)
+    blank_role = []
+    for (path,) in db.execute("SELECT path FROM fts WHERE type='person' ORDER BY path").fetchall():
+        fm, _ = parse_frontmatter((ROOT / path).read_text(encoding="utf-8"))
+        if not str(fm.get("role") or "").strip():
+            blank_role.append(Path(path).stem)
+    for label, names in (("no relationship", blank_rel), ("no role", blank_role)):
+        if names:
+            n += 1
+            more = f" +{len(names) - 6} more" if len(names) > 6 else ""
+            print(f"  {label:<17} {len(names)} file(s): {', '.join(names[:6])}{more}")
     return n
 
 
@@ -1703,6 +1880,10 @@ def cmd_lint(args) -> int:
         paths.append(daily_path(today()))
         if args.path:
             paths = [ROOT / p if not Path(p).is_absolute() else Path(p) for p in args.path]
+            missing = [str(p) for p in paths if not p.is_file()]
+            if missing:
+                print(f"no such file: {', '.join(missing)}", file=sys.stderr)
+                return 1
         print("\x1b[1mstyle\x1b[0m")
         total += lint_style(paths)
     if (args.structure or both) and not args.path:
@@ -1741,6 +1922,8 @@ def cmd_priorities(args) -> int:
     db = fresh_db()
     td = today().isoformat()
     for n, text in enumerate(items, 1):
+        if text.lstrip().startswith("~~"):
+            continue  # struck in place: no longer a priority, keep the others' numbers
         targets = [resolve_link(t) for t in WIKILINK.findall(text)]
         best = ""
         best_path = ""
@@ -1751,7 +1934,8 @@ def cmd_priorities(args) -> int:
             if tp.exists():
                 _, tbody = parse_frontmatter(tp.read_text(encoding="utf-8"))
                 secs = sections_of(strip_scaffolding(tbody))
-                for d in DATE_RE.findall(secs.get("log", "") + secs.get("history", "")):
+                log = secs.get("log", "") + secs.get("history", "")
+                for d in LOG_ENTRY_DATE.findall(log) or DATE_RE.findall(log):
                     if d <= td and d > best:
                         best, best_path = d, t
             for src, dt in db.execute(
@@ -1966,6 +2150,19 @@ FATHOM_LINE = re.compile(
 CALL_ID_RE = re.compile(r"fathom\.video/(?:calls|share)/([\w-]+)")
 
 
+def _ist_date(stamp) -> str:
+    """YYYY-MM-DD in the owner's timezone from an ISO timestamp. A bare date passes through."""
+    s = str(stamp)
+    if "T" in s:
+        try:
+            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+            if dt.tzinfo:
+                return dt.astimezone(LOCAL_TZ).date().isoformat()
+        except ValueError:
+            pass
+    return s[:10]
+
+
 def parse_fathom(text: str) -> list[dict]:
     """Fathom meetings from either the connector's text listing (one `- title |
     date | id: N | url: U | recorded by R | invitees` line each) or JSON."""
@@ -1982,7 +2179,7 @@ def parse_fathom(text: str) -> list[dict]:
                 rec = rec.get("name") or rec.get("email", "")
             out.append({
                 "title": m.get("title") or m.get("meeting_title") or "",
-                "date": str(m.get("date") or m.get("created_at") or m.get("recording_start_time") or "")[:10],
+                "date": _ist_date(m.get("date") or m.get("created_at") or m.get("recording_start_time") or ""),
                 "id": str(m.get("recording_id") or m.get("id") or ""),
                 "url": m.get("url") or m.get("share_url") or "",
                 "recorded_by": rec,
@@ -2051,7 +2248,12 @@ def _filed(m: dict, library: str, notes: dict[str, list[str]]) -> str:
             return needle
     want = slugify(m["title"])
     for stem in notes.get(m["date"], []):
-        if difflib.SequenceMatcher(None, want, stem).ratio() >= 0.6:
+        # A note that already names a Fathom call (not this one, or the id check above
+        # would have hit) is another meeting unless the title is near identical: two
+        # interviews on one day, or a weekly sync and a weekly review.
+        note = MEMORY / "meetings" / f"{m['date']}-{stem}.md"
+        other = note.exists() and CALL_ID_RE.search(note.read_text(encoding="utf-8", errors="replace"))
+        if difflib.SequenceMatcher(None, want, stem).ratio() >= (0.9 if other else 0.6):
             return stem
     return ""
 
@@ -2130,10 +2332,18 @@ def cmd_meetings(args) -> int:
     if not args.fathom and not args.calendar:
         print("pass a Fathom listing, --calendar, or both", file=sys.stderr)
         return 1
-    fathom = []
-    if args.fathom:
-        fathom = parse_fathom(Path(args.fathom).read_text(encoding="utf-8") if args.fathom != "-" else sys.stdin.read())
-    calendar = parse_calendar(Path(args.calendar).read_text(encoding="utf-8")) if args.calendar else []
+    fathom, calendar = [], []
+    try:
+        if args.fathom:
+            fathom = parse_fathom(Path(args.fathom).read_text(encoding="utf-8") if args.fathom != "-" else sys.stdin.read())
+        if args.calendar:
+            calendar = parse_calendar(Path(args.calendar).read_text(encoding="utf-8"))
+    except OSError as e:
+        print(f"cannot read the listing: {e}", file=sys.stderr)
+        return 1
+    except json.JSONDecodeError as e:
+        print(f"the listing is not valid JSON: {e}", file=sys.stderr)
+        return 1
     if not fathom and not calendar:
         print("no meetings parsed. Fathom: the list_meetings output, text or JSON. Calendar: list_events JSON.", file=sys.stderr)
         return 1
@@ -2163,6 +2373,53 @@ def _git(*a: str) -> str:
         return ""
 
 
+HINT_STOP = {"the", "and", "for", "with", "that", "this", "from", "into", "when", "then", "than",
+             "only", "not", "seen", "brain", "skill", "skills", "sweep", "chat", "review", "weekly"}
+HINT_MAX_FILES = 15   # a commit that touches more is a sweep or a scaffold, not a fix
+
+
+def _improvement_paths(text: str) -> list[str]:
+    """Code paths an improvement item is about: any bin/, skills/, routines/ or
+    templates/ path it names, plus bin/<area> and skills/<area> when they exist."""
+    out: list[str] = []
+    for m in re.findall(r"\b((?:bin|skills|routines|templates)/[\w./-]+)", text):
+        out.append(m.rstrip("./"))
+    lead = BOLD_LEAD.search(text)
+    if lead:
+        area = lead.group(1).strip().lower()
+        for cand in (f"bin/{area}", f"skills/{area}", f"routines/{area}.md"):
+            if (ROOT / cand).exists():
+                out.append(cand)
+        if area == "whatsapp":
+            out.append("bin/wa-bridge")
+    keep = []
+    for x in out:
+        if x not in keep and (ROOT / x).exists():
+            keep.append(x)
+    return keep
+
+
+def _fix_hint(text: str, paths: list[str], log: str) -> str:
+    """A commit counts as a possible fix only if it touches one of the item's own
+    paths, is small, and its subject shares two real words with the item. `log` is
+    `git log --name-only --format=@@%h %s` already limited to those paths and to
+    commits after the last sighting. Word overlap alone was wrong every week."""
+    words = {w for w in re.findall(r"[a-z]{4,}", re.sub(r"\*\*", "", text).lower()) if w not in HINT_STOP}
+    for block in log.split("@@")[1:]:
+        lines = [l for l in block.splitlines() if l.strip()]
+        if not lines:
+            continue
+        subject, files = lines[0], lines[1:]
+        if len(files) > HINT_MAX_FILES:
+            continue
+        if not any(f == p or f.startswith(p.rstrip("/") + "/") for f in files for p in paths):
+            continue
+        lw = set(re.findall(r"[a-z]{4,}", subject.lower())) - HINT_STOP
+        if len(words & lw) >= 2:
+            return f"possibly fixed: {subject[:70]}"
+    return ""
+
+
 def cmd_improvements(args) -> int:
     """Open items in memory/improvements.md, with how often they were seen and
     whether a commit since the ask touched skills/ or bin/ with matching words.
@@ -2190,7 +2447,6 @@ def cmd_improvements(args) -> int:
             cur = None
     if cur:
         items.append((cur_open, " ".join(x.strip() for x in cur)))
-    stop = {"the", "and", "for", "with", "that", "this", "from", "into", "when", "then", "than", "only", "not"}
     n = 0
     for is_open, text in items:
         if not is_open:
@@ -2198,20 +2454,217 @@ def cmd_improvements(args) -> int:
         n += 1
         seen = re.findall(r"seen\s+(\d{4}-\d{2}-\d{2})", text)
         first = min(seen) if seen else (DATE_RE.search(text).group(1) if DATE_RE.search(text) else "")
-        words = {w for w in re.findall(r"[a-z]{4,}", re.sub(r"\*\*", "", text).lower()) if w not in stop}
         hint = ""
-        if first:
-            log = _git("log", f"--since={first}", "--format=%h %s", "--", "skills", "bin", "routines", "templates", "CLAUDE.md")
-            for line in log.splitlines():
-                lw = set(re.findall(r"[a-z]{4,}", line.lower()))
-                if len(words & lw) >= 2:
-                    hint = f"possibly fixed: {line[:70]}"
-                    break
+        paths = _improvement_paths(text)
+        if seen and paths:
+            # Only commits after the last sighting can have fixed it.
+            log = _git("log", f"--since={max(seen)}T23:59:59", "--name-only", "--format=@@%h %s", "--", *paths)
+            hint = _fix_hint(text, paths, log)
         lead = BOLD_LEAD.search(text)
         label = re.sub(r"\*\*", "", text)[:80]
         mark = "\x1b[31m" if len(seen) >= 2 else ""
         print(f"  {mark}{len(seen):>2}x\x1b[0m  since {first or '?'}  {label}" + (f"\n        \x1b[33m{hint}\x1b[0m" if hint else ""))
     print(f"{n} open improvement(s)")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# sessions — what got started in Claude Code and then dropped
+# --------------------------------------------------------------------------
+
+# Claude Code writes one JSONL transcript per session under ~/.claude/projects/.
+# Tests point this at a fixture folder.
+PROJECTS_DIR = Path(os.environ.get("CLAUDE_PROJECTS_DIR") or Path.home() / ".claude" / "projects")
+PR_CACHE = INDEX_DIR / "pr-state.json"
+SYSTEM_BLOCK = re.compile(r"<system-reminder>.*?</system-reminder>", re.DOTALL)
+
+
+def _prompt_text(msg) -> str:
+    """The human text of a user record, or "" for tool results and empty turns."""
+    c = msg.get("content") if isinstance(msg, dict) else None
+    if isinstance(c, str):
+        text = c
+    elif isinstance(c, list):
+        parts = [x.get("text", "") for x in c if isinstance(x, dict) and x.get("type") == "text"]
+        text = " ".join(parts)
+    else:
+        return ""
+    text = SYSTEM_BLOCK.sub("", text)
+    return " ".join(text.split())
+
+
+def _read_session(path: Path) -> dict | None:
+    """One transcript -> title, repo, branch, PR, first and last activity, prompt count.
+    Skips subagent sidechains. Returns None for a file with no human prompt."""
+    info = {
+        "id": path.stem, "title": "", "ai_title": "", "first_prompt": "", "last_prompt": "",
+        "cwd": "", "branch": "", "pr": None, "first": "", "last": "", "prompts": 0, "routine": False,
+    }
+    try:
+        fh = path.open(encoding="utf-8")
+    except OSError:
+        return None
+    with fh:
+        for line in fh:
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            t = d.get("type")
+            if t == "custom-title":
+                info["title"] = d.get("customTitle") or info["title"]
+            elif t == "ai-title":
+                info["ai_title"] = d.get("aiTitle") or info["ai_title"]
+            elif t == "pr-link":
+                info["pr"] = {"number": d.get("prNumber"), "repo": d.get("prRepository"), "url": d.get("prUrl")}
+            elif t == "last-prompt":
+                info["last_prompt"] = d.get("lastPrompt") or ""
+            if d.get("isSidechain"):
+                continue
+            ts = d.get("timestamp")
+            if ts and t in ("user", "assistant"):
+                info["first"] = info["first"] or ts
+                info["last"] = max(info["last"], ts)
+            if t == "user":
+                text = _prompt_text(d.get("message"))
+                if not text:
+                    continue
+                if text.startswith("<scheduled-task"):
+                    info["routine"] = True
+                info["prompts"] += 1
+                info["first_prompt"] = info["first_prompt"] or text
+                info["cwd"] = d.get("cwd") or info["cwd"]
+                info["branch"] = d.get("gitBranch") or info["branch"]
+    if not info["first_prompt"] or not info["last"]:
+        return None
+    info["title"] = info["title"] or info["ai_title"] or info["first_prompt"][:70]
+    return info
+
+
+def _repo_name(cwd: str) -> str:
+    """my-app from /…/my-app/.claude/worktrees/x."""
+    if not cwd:
+        return "?"
+    parts = cwd.split("/")
+    if ".claude" in parts:
+        parts = parts[: parts.index(".claude")]
+    return parts[-1] if parts else "?"
+
+
+def _pr_state(pr: dict, cache: dict, use_gh: bool) -> str:
+    """open | merged | closed | ?  Merged and closed are final and cached for good."""
+    if not pr or not pr.get("number") or not pr.get("repo"):
+        return ""
+    key = f"{pr['repo']}#{pr['number']}"
+    if cache.get(key) in ("merged", "closed"):
+        return cache[key]
+    if not use_gh:
+        return cache.get(key, "?")
+    try:
+        out = subprocess.run(
+            ["gh", "pr", "view", str(pr["number"]), "--repo", pr["repo"], "--json", "state"],
+            capture_output=True, text=True, timeout=20, check=False,
+        ).stdout
+        state = json.loads(out).get("state", "").lower() or "?"
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        state = cache.get(key, "?")
+    cache[key] = state
+    return state
+
+
+def cmd_sessions(args) -> int:
+    """Claude Code sessions from the last --days days, one line each, with the
+    ones that look dropped first: unfinished (no PR, or PR still open) and idle
+    for --idle days or more. Routine runs and merged PRs are hidden. Reads local
+    transcripts only, so this runs on the laptop, never in the cloud."""
+    if not PROJECTS_DIR.is_dir():
+        print(f"no transcripts at {PROJECTS_DIR}")
+        return 1
+    cutoff = now() - timedelta(days=args.days)
+    sessions = []
+    for path in PROJECTS_DIR.glob("*/*.jsonl"):
+        try:
+            if datetime.fromtimestamp(path.stat().st_mtime, LOCAL_TZ) < cutoff:
+                continue
+        except OSError:
+            continue
+        info = _read_session(path)
+        if not info or info["routine"] or info["prompts"] < args.min_turns:
+            continue
+        info["last_dt"] = datetime.fromisoformat(info["last"].replace("Z", "+00:00")).astimezone(LOCAL_TZ)
+        if info["last_dt"] < cutoff:
+            continue
+        sessions.append(info)
+
+    # Same branch or same title, several sessions: keep the newest.
+    sessions.sort(key=lambda s: s["last_dt"], reverse=True)
+    seen: set[str] = set()
+    kept = []
+    for s in sessions:
+        if s["pr"] and s["pr"].get("number"):
+            key = f"pr:{s['pr'].get('repo')}#{s['pr']['number']}"
+        elif s["branch"] and s["branch"] not in ("master", "main", "HEAD"):
+            key = f"branch:{_repo_name(s['cwd'])}:{s['branch']}"
+        else:
+            key = f"title:{_repo_name(s['cwd'])}:{s['title'].lower()}"
+        if key in seen:
+            continue
+        seen.add(key)
+        kept.append(s)
+
+    cache: dict = {}
+    if PR_CACHE.exists():
+        try:
+            cache = json.loads(PR_CACHE.read_text(encoding="utf-8"))
+        except ValueError:
+            cache = {}
+    use_gh = not args.no_gh and shutil.which("gh") is not None
+    for s in kept:
+        s["pr_state"] = _pr_state(s["pr"], cache, use_gh)
+        s["idle"] = (now() - s["last_dt"]).days
+        s["repo"] = _repo_name(s["cwd"])
+    if use_gh:
+        INDEX_DIR.mkdir(exist_ok=True)
+        PR_CACHE.write_text(json.dumps(cache, indent=1, sort_keys=True), encoding="utf-8")
+
+    done = [s for s in kept if s["pr_state"] in ("merged", "closed")]
+    live = [s for s in kept if s not in done]
+    dropped = [s for s in live if s["idle"] >= args.idle]
+    active = [s for s in live if s["idle"] < args.idle]
+
+    if args.json:
+        rows = [{k: v for k, v in s.items() if k != "last_dt"} for s in (dropped + active + (done if args.all else []))]
+        for r in rows:
+            r["dropped"] = r["idle"] >= args.idle and r["pr_state"] not in ("merged", "closed")
+        print(json.dumps(rows, indent=1))
+        return 0
+
+    def line(s):
+        pr = s["pr"]
+        if pr and pr.get("number"):
+            tail = f"PR #{pr['number']} {s['pr_state'] or '?'}"
+        elif s["branch"] and s["branch"] not in ("master", "main"):
+            tail = f"no PR · {s['branch']}"
+        else:
+            tail = "no PR, no branch"
+        return f"  {s['idle']:>3}d  {s['repo'][:24]:<24} {s['title'][:56]:<56} {tail}"
+
+    print(f"\x1b[1mDropped\x1b[0m ({len(dropped)}): idle {args.idle}+ days, not merged")
+    for s in dropped:
+        print(line(s))
+    if not dropped:
+        print("  nothing")
+    print(f"\n\x1b[1mActive\x1b[0m ({len(active)})")
+    for s in active:
+        print(line(s))
+    if args.all:
+        print(f"\n\x1b[1mDone\x1b[0m ({len(done)}): PR merged or closed")
+        for s in done:
+            print(line(s))
+    else:
+        print(f"\n{len(done)} done (PR merged or closed), hidden. --all shows them.")
+    if not use_gh:
+        print("PR states from cache only: gh not run.")
     return 0
 
 
@@ -2224,11 +2677,16 @@ SECRET_PATTERNS = [
     ("google oauth token", re.compile(r"ya29\.[0-9A-Za-z_-]{20,}")),
     ("google client secret", re.compile(r"GOCSPX-[0-9A-Za-z_-]{20,}")),
     ("openai/anthropic key", re.compile(r"\bsk-(?:ant-)?[A-Za-z0-9_-]{24,}")),
-    ("slack token", re.compile(r"\bxox[abpr]-[0-9A-Za-z-]{10,}")),
+    ("slack token", re.compile(r"\b(?:xox[abeprs]|xapp)-[0-9A-Za-z-]{10,}")),
+    ("github token", re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{60,})")),
+    ("stripe key", re.compile(r"\b[sr]k_live_[A-Za-z0-9]{16,}")),
+    ("jwt", re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}")),
     ("private key", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
     ("refresh token field", re.compile(r"[\"']?refresh_token[\"']?\s*[:=]\s*[\"']?[A-Za-z0-9_./-]{20,}")),
-    ("client secret field", re.compile(r"client_secret\s*[:=]\s*[\"']?[A-Za-z0-9_-]{12,}")),
-    ("password field", re.compile(r"\bpassword\s*[:=]\s*[\"']?\S{6,}", re.I)),
+    # FATHOM_API_KEY=..., "api_key": "...", access_token: ... The quote may sit before the colon (JSON).
+    ("api key field", re.compile(r"\b[A-Za-z0-9_]*(?:api[_-]?key|access[_-]?token|secret[_-]?key)[\"']?\s*[:=]\s*[\"']?[A-Za-z0-9_./+=-]{16,}", re.I)),
+    ("client secret field", re.compile(r"client_secret[\"']?\s*[:=]\s*[\"']?[A-Za-z0-9_-]{12,}")),
+    ("password field", re.compile(r"\b(?:password|passwd|pwd)[\"']?\s*[:=]\s*[\"']?\S{6,}", re.I)),
     ("bearer token", re.compile(r"Bearer\s+[A-Za-z0-9_.-]{20,}")),
     ("aws key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
 ]
@@ -2236,7 +2694,9 @@ SECRET_SKIP = ("node_modules/", ".brain/")
 
 
 def cmd_secrets(args) -> int:
-    files = _git("ls-files").splitlines()
+    # Tracked files, and new ones git would add. Every routine runs this and then
+    # `git add -A`, so a note written in that run must be scanned before it is committed.
+    files = _git("ls-files", "--cached", "--others", "--exclude-standard").splitlines()
     if args.staged:
         files = _git("diff", "--cached", "--name-only").splitlines()
     hits = 0
@@ -2258,7 +2718,7 @@ def cmd_secrets(args) -> int:
                         continue
                     hits += 1
                     print(f"  {f}:{i}  {label}  {line.strip()[:60]}")
-    print(f"{hits} possible secret(s) in {len(files)} tracked file(s)")
+    print(f"{hits} possible secret(s) in {len(files)} file(s), tracked and new")
     return 1 if hits else 0
 
 
@@ -2268,7 +2728,7 @@ def cmd_secrets(args) -> int:
 
 # Error analysis, from the evals-skills repo, sized for one reader. Code picks what to
 # read: every kind of output gets a turn, then random picks cover what the kinds miss.
-# He writes plain notes. The review-outputs skill sorts them. Added 2026-09-28.
+# The owner writes plain notes. The review-outputs skill sorts them. Added 2026-09-28.
 
 SAMPLE_LOG_KINDS = [  # heading prefix under ## Log -> kind. First match wins.
     ("morning brief", "morning brief"), ("re-rank", "morning brief"),
@@ -2378,7 +2838,7 @@ def sample_sheet(picks: list[dict], month: str, days: int) -> str:
 
 
 def sheet_notes(path: Path) -> list[dict]:
-    """His notes from a review sheet: the sample each belongs to, and the note.
+    """The owner's notes from a review sheet: the sample each belongs to, and the note.
     A note runs from `Note:` to the next heading. Empty ones are left out."""
     out, cur = [], None
     for line in path.read_text(encoding="utf-8").splitlines():
@@ -2417,6 +2877,9 @@ def cmd_sample(args) -> int:
         print(f"{len(notes)} note(s)")
         return 0
     month = args.month or today().strftime("%Y-%m")
+    if not re.fullmatch(r"\d{4}-\d{2}", month):
+        print("--month takes YYYY-MM", file=sys.stderr)
+        return 1
     units = sample_units(args.days)
     if not units:
         print(f"nothing written in the last {args.days} days")
@@ -2564,6 +3027,10 @@ def main() -> int:
     p.add_argument("--days", type=int, default=7)
     p.set_defaults(func=cmd_carried)
 
+    p = sub.add_parser("proposals", help="tasks the briefs proposed, deduped across days, and how many the owner accepted")
+    p.add_argument("--days", type=int, default=7)
+    p.set_defaults(func=cmd_proposals)
+
     p = sub.add_parser("top3", help="the day's Top 3 from each brief, the evening's verdict per task, and who sat undone")
     p.add_argument("--days", type=int, default=7)
     p.set_defaults(func=cmd_top3)
@@ -2585,6 +3052,15 @@ def main() -> int:
     p.add_argument("--tasks", metavar="FILE",
                    help="every Hespia task id, done or open (JSON or one per line): flag hespia: tags that are not tasks")
     p.set_defaults(func=cmd_lint)
+
+    p = sub.add_parser("sessions", help="Claude Code sessions started recently, the dropped ones first (local transcripts only)")
+    p.add_argument("--days", type=int, default=30, help="look back this many days (default 30)")
+    p.add_argument("--idle", type=int, default=3, help="idle this many days counts as dropped (default 3)")
+    p.add_argument("--min-turns", type=int, default=2, help="ignore sessions with fewer human prompts (default 2)")
+    p.add_argument("--all", action="store_true", help="also list sessions whose PR merged or closed")
+    p.add_argument("--no-gh", action="store_true", help="do not call gh; PR states come from the cache only")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_sessions)
 
     p = sub.add_parser("sample", help="pick the month's outputs for a read-through, or read the notes back from the sheet")
     p.add_argument("-n", type=int, default=15, help="how many to pick (default 15)")
@@ -2621,7 +3097,7 @@ def main() -> int:
     p = sub.add_parser("config", help="check brain.json: who this library belongs to, their timezone, their Hespia org")
     p.set_defaults(func=cmd_config)
 
-    p = sub.add_parser("secrets", help="scan tracked files for anything that looks like a credential")
+    p = sub.add_parser("secrets", help="scan tracked and new files for anything that looks like a credential")
     p.add_argument("--staged", action="store_true", help="only files staged for commit")
     p.set_defaults(func=cmd_secrets)
 

@@ -28,7 +28,7 @@ Friday reviews. Saturday plans. Monday's brief starts from the plan.
    message with that `ref`. Tasks in it are **proposed**, never created.
 
 6. Write the plan under `### Weekly plan` in the skill's shape. Every day line carries
-   a `<!-- hespia:ID -->`. Proposed items carry `<!-- proposed -->`. The message id
+   a `<!-- hespia:ID -->`. Proposed items carry `<!-- proposed:slug -->`. The message id
    goes at the end as `<!-- hespia-msg:ID -->`.
 
 7. Run `bin/brain lint --path memory/daily/<today>.md`. Any em dash: rewrite the

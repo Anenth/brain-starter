@@ -91,6 +91,15 @@ class SampleTests(unittest.TestCase):
         self.assertEqual(notes[1]["note"], "Too long.\nCut it to three bullets.")
         self.assertTrue(all("#" in n["sample"] for n in notes))
 
+    def test_month_must_be_a_month(self):
+        # Found in review 2026-11-22: --month went straight into the file name.
+        for bad in ("../../outside/escaped", "Nov", "2026-9"):
+            r = run(self.tmp, "sample", "-n", "3", "--write", "--month", bad)
+            self.assertEqual(r.returncode, 1, bad)
+            self.assertIn("YYYY-MM", r.stderr)
+        self.assertEqual([p.name for p in (self.tmp / "memory" / "inbox").iterdir()], [])
+        self.assertFalse((self.tmp.parent / "outside").exists())
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

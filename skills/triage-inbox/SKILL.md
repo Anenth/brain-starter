@@ -31,9 +31,15 @@ Sent first so nothing goes out twice.
    already there. Also run a fourth search, `in:sent newer_than:3d`, to catch replies
    the owner sent from a phone between runs. Same check on each. A reply with questions
    in it, dropped as "answered", is how a thread goes silent for weeks.
+   **Cc'd threads are already in.** Gmail's `to:me` matches To and Cc, so the third
+   search returns threads the owner is only cc'd on. No extra search needed. Sort
+   those as **FYI** or **Needs a reply, not from the owner**. Never **Needs the
+   owner**, unless a message names them in the body: an @mention, their name, or a
+   question put to them. Then run step 5 on every one.
 2. For each thread, read enough to answer: **what is being asked, and of whom?**
 3. Sort:
    - **Needs the owner**: a decision only they can make, or someone blocked on their reply.
+     A thread they are only cc'd on lands here only if it names them.
    - **Needs a reply, not from the owner**: say who should own it.
    - **FYI**: one line.
    - **Noise**: count only.
@@ -41,6 +47,11 @@ Sent first so nothing goes out twice.
    you owe an SSO date" is worth ten times "Ada Lovelace".
 5. **Anything in a thread that is a fact worth keeping**: a decision made over email, a
    new person, a number. Becomes a note. That's the point. Email is where memory leaks.
+   **FYI is a sort for the report, not a reason to skip this step.** An FYI or cc'd
+   thread with a decision, a number, a plan or an open question still becomes a note,
+   and any promise in it goes to step 7. Check it is not filed yet:
+   `grep -rl "gmail:<threadId>" memory/`. Tag what you file with
+   `<!-- gmail:<threadId> -->` so the next run can tell.
 6. **Draft by default.** Every "needs the owner" thread that a reply could answer gets a
    draft via Gmail `create_draft`, written by `skills/draft-reply/SKILL.md`: research
    first, then short, in the owner's voice. Even when the content needs their judgement.

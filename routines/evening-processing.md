@@ -100,8 +100,9 @@ Work in the repository checkout. Read CLAUDE.md and memory/profile.md first.
    down as skills/check-in/SKILL.md says, strike or date the chase line, and quote
    the answer under `## Log`. Then for today's morning message, read which of its
    tasks the owner accepted and the task ids they got. In today's daily note, replace
-   the `<!-- proposed -->` on each accepted item with `<!-- hespia:ID -->`. Items they
-   did not accept keep `<!-- proposed -->`. Their reply, if any, goes under `## Log`
+   the proposed tag on each accepted item with `<!-- hespia:ID -->`. If the tag had a
+   slug, keep it as `<!-- accepted:slug -->` beside the task id. Items they did not
+   accept keep their `<!-- proposed:slug -->` (or bare `<!-- proposed -->`) as it is. Their reply, if any, goes under `## Log`
    word for word. Never accept a task for the owner.
 
 10. **Review the Top 3.** The morning run put three tasks at the top of the owner's
@@ -162,7 +163,8 @@ Work in the repository checkout. Read CLAUDE.md and memory/profile.md first.
     It lists every unstruck item from recent briefs, deduped by tag, oldest first,
     tags intact. Remove what is genuinely closed and say why. Add nothing by hand
     that is not in a brief or the ledger. Tomorrow's brief reads this section. Keep
-    every `<!-- hespia:ID -->`, `<!-- hespia-msg:ID -->` and `<!-- proposed -->` tag.
+    every `<!-- hespia:ID -->`, `<!-- hespia-msg:ID -->`, `<!-- proposed:slug -->`,
+    `<!-- accepted:slug -->` and `<!-- proposed -->` tag.
     A carried item that loses its tag gets proposed again in the morning.
 
 12. Under `### Evening processing`, close with one line: recordings found, notes

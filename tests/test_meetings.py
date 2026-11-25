@@ -130,6 +130,36 @@ class MeetingTests(unittest.TestCase):
         self.assertIn("full 2  light 1  no-trace 0  line 1  skip 1  done 2", r.stdout)
         self.assertNotIn("Hedy<>Acme", r.stdout)
 
+    # found in review 2026-11-22 ------------------------------------------------
+
+    def test_a_second_call_that_day_is_not_hidden_behind_the_first_note(self):
+        # Two interviews on one day. One has a note. The other must still need one.
+        (self.tmp / "memory" / "meetings" / "2026-09-18-interview-linus.md").write_text(
+            "---\ntype: meeting\ntitle: Interview Linus\ndate: 2026-09-18\n"
+            "source: https://fathom.video/calls/900000001\n---\n\n# Interview\n", encoding="utf-8")
+        (self.tmp / "fathom.txt").write_text(
+            "- Interview Linus | 2026-09-18 | id: 1 | url: https://fathom.video/calls/900000001 | recorded by Ada Lovelace | Linus\n"
+            "- Interview Edsger | 2026-09-18 | id: 2 | url: https://fathom.video/calls/900000002 | recorded by Ada Lovelace | Edsger\n",
+            encoding="utf-8")
+        rows = self.rows()
+        self.assertEqual(rows["Interview Linus"]["action"], "done")
+        self.assertNotEqual(rows["Interview Edsger"]["action"], "done")
+
+    def test_json_listing_is_filed_under_its_local_date(self):
+        # 21:00 UTC on the 20th is 02:30 on the 21st in the fixture's timezone.
+        (self.tmp / "fathom.txt").write_text(json.dumps([{
+            "title": "Late call", "created_at": "2026-09-20T21:00:00Z", "recording_id": 7,
+            "url": "https://fathom.video/calls/900000007", "recorded_by": {"name": "Ada Lovelace"},
+            "calendar_invitees": [{"name": "Ada Lovelace"}]}]), encoding="utf-8")
+        self.assertEqual(self.rows()["Late call"]["date"], "2026-09-21")
+
+    def test_a_broken_listing_is_one_line_not_a_traceback(self):
+        (self.tmp / "fathom.txt").write_text("[{broken", encoding="utf-8")
+        for args in ((str(self.tmp / "fathom.txt"),), (str(self.tmp / "nope.txt"),)):
+            r = run(self.tmp, "meetings", *args)
+            self.assertEqual(r.returncode, 1)
+            self.assertNotIn("Traceback", r.stderr)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=1)
